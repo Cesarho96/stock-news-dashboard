@@ -1,0 +1,58 @@
+{
+  "title": { "en": "AI Stock News Dashboard", "es": "Tablero Bursátil con IA" },
+  "market": "US",
+  "timezone": "America/New_York",
+  "timezoneLabel": "ET",
+  "strip": [
+    { "symbol": "SPY", "name": "S&P 500", "note": "SPY ETF" },
+    { "symbol": "QQQ", "name": "Nasdaq 100", "note": "QQQ ETF" },
+    { "symbol": "DIA", "name": "Dow 30", "note": "DIA ETF" },
+    { "symbol": "IWM", "name": "Russell 2000", "note": "IWM ETF" },
+    { "symbol": "TLT", "name": "20Y+ Treasuries", "note": "TLT ETF" },
+    { "symbol": "GLD", "name": "Gold", "note": "GLD ETF" },
+    { "symbol": "USO", "name": "Oil", "note": "USO ETF" },
+    { "symbol": "UUP", "name": "US Dollar", "note": "UUP ETF" }
+  ],
+  "sectors": [
+    { "id": "technology", "etf": "XLK", "label": { "en": "Technology", "es": "Tecnología" } },
+    { "id": "semiconductors", "etf": "SMH", "label": { "en": "Semiconductors", "es": "Semiconductores" } },
+    { "id": "communication", "etf": "XLC", "label": { "en": "Communication", "es": "Comunicaciones" } },
+    { "id": "consumer", "etf": "XLY", "label": { "en": "Consumer", "es": "Consumo" } },
+    { "id": "financials", "etf": "XLF", "label": { "en": "Financials", "es": "Financiero" } },
+    { "id": "healthcare", "etf": "XLV", "label": { "en": "Health care", "es": "Salud" } },
+    { "id": "energy", "etf": "XLE", "label": { "en": "Energy", "es": "Energía" } },
+    { "id": "industrials", "etf": "XLI", "label": { "en": "Industrials", "es": "Industriales" } }
+  ],
+  "watchlist": [
+    { "symbol": "AAPL", "name": "Apple", "sector": "technology", "cik": 320193, "aliases": ["Apple", "iPhone"] },
+    { "symbol": "MSFT", "name": "Microsoft", "sector": "technology", "cik": 789019, "aliases": ["Microsoft"] },
+    { "symbol": "NVDA", "name": "NVIDIA", "sector": "semiconductors", "cik": 1045810, "aliases": ["Nvidia"] },
+    { "symbol": "AVGO", "name": "Broadcom", "sector": "semiconductors", "cik": 1730168, "aliases": ["Broadcom"] },
+    { "symbol": "AMZN", "name": "Amazon", "sector": "consumer", "cik": 1018724, "aliases": ["Amazon", "AWS"] },
+    { "symbol": "TSLA", "name": "Tesla", "sector": "consumer", "cik": 1318605, "aliases": ["Tesla"] },
+    { "symbol": "GOOGL", "name": "Alphabet", "sector": "communication", "cik": 1652044, "aliases": ["Alphabet", "Google"] },
+    { "symbol": "META", "name": "Meta Platforms", "sector": "communication", "cik": 1326801, "aliases": ["Meta", "Facebook", "Instagram"] },
+    { "symbol": "NFLX", "name": "Netflix", "sector": "communication", "cik": 1065280, "aliases": ["Netflix"] },
+    { "symbol": "JPM", "name": "JPMorgan Chase", "sector": "financials", "cik": 19617, "aliases": ["JPMorgan", "JP Morgan"] },
+    { "symbol": "LLY", "name": "Eli Lilly", "sector": "healthcare", "cik": 59478, "aliases": ["Eli Lilly", "Lilly"] },
+    { "symbol": "XOM", "name": "Exxon Mobil", "sector": "energy", "cik": 34088, "aliases": ["Exxon", "ExxonMobil"] }
+  ],
+  "rss": [
+    { "id": "cnbc-market-insider", "name": "CNBC", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20409666" },
+    { "id": "marketwatch-top", "name": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories" },
+    { "id": "wsj-markets", "name": "WSJ", "url": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain" },
+    { "id": "federal-reserve", "name": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml" }
+  ],
+  "limits": {
+    "companyNewsInWindow": 6,
+    "companyNewsContext": 2,
+    "marketNews": 25,
+    "rssPerFeed": 8,
+    "filingsPerTicker": 3,
+    "maxEvidence": 200,
+    "summaryChars": 280,
+    "contextDays": 7,
+    "earningsDaysAhead": 14,
+    "manifestEditions": 120
+  }
+}

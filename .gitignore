@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.aws-sam/
+.venv/
+.env
+# Local editions written by run_local.py (production editions live in S3)
+web/data/

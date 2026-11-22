@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AI stock news dashboard. A scheduled Lambda news agent collects market data and news,
+  asks Claude on Amazon Bedrock to write a validated edition, and publishes JSON to a
+  private S3 bucket served through CloudFront.
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-5-5
+    AllowedPattern: "^[a-z]+\\.[a-z0-9-]+\\.[A-Za-z0-9.:-]+$"
+    Description: >
+      Bedrock inference profile ID (prefix.provider.model), e.g. global.anthropic.claude-sonnet-5-5,
+      us.anthropic.claude-sonnet-5-5 or global.anthropic.claude-haiku-5-5 (cheaper).
+  Effort:
+    Type: String
+    Default: medium
+    AllowedValues: [low, medium, high, xhigh, max, none]
+    Description: Claude effort level (how much it thinks). "none" uses the model default.
+  Language:
+    Type: String
+    Default: en
+    AllowedValues: [en, es]
+    Description: Language of the AI-written text and dashboard labels.
+  Watchlist:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated tickers that replace the watchlist in config/watchlist.json.
+  ScheduleExpression:
+    Type: String
+    Default: cron(35 8,12,16 ? * MON-FRI *)
+    Description: When to publish editions (pre-market, midday, after the close).
+  ScheduleTimezone:
+    Type: String
+    Default: America/New_York
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  FinnhubKeyParameterName:
+    Type: String
+    Default: /stock-news-dashboard/finnhub-api-key
+    AllowedPattern: "^/[A-Za-z0-9_./-]+$"
+    Description: SSM Parameter Store SecureString that holds your Finnhub API key.
+  SecUserAgent:
+    Type: String
+    Default: ""
+    Description: 'SEC EDGAR contact header, e.g. "Your Name you@example.com". Empty disables SEC filings.'
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for failure alerts (confirm the SNS subscription email).
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- static site
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-site-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security-headers"
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} stock news dashboard"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized (honors Cache-Control)
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------- news agent
+  NewsAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-news-agent"
+      RetentionInDays: 30
+
+  NewsAgentFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: NewsAgentLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-news-agent"
+      Description: Collects market news, writes the edition with Claude on Bedrock, publishes to S3.
+      CodeUri: agent/
+      Handler: stocknews.handler.lambda_handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 512
+      Timeout: 900
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0 # a retry would mean a second paid LLM run
+        MaximumEventAgeInSeconds: 3600
+      Environment:
+        Variables:
+          SITE_BUCKET: !Ref SiteBucket
+          MODEL_ID: !Ref ModelId
+          BEDROCK_REGION: !Ref AWS::Region
+          EFFORT: !Ref Effort
+          LANGUAGE: !Ref Language
+          WATCHLIST: !Ref Watchlist
+          FINNHUB_KEY_PARAM: !Ref FinnhubKeyParameterName
+          SEC_USER_AGENT: !Ref SecUserAgent
+          LOG_LEVEL: INFO
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: InvokeClaudeOnBedrock
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/${ModelId}"
+                - !Sub
+                  - "arn:${AWS::Partition}:bedrock:*::foundation-model/${Model}"
+                  - Model: !Join [".", [!Select [1, !Split [".", !Ref ModelId]], !Select [2, !Split [".", !Ref ModelId]]]]
+                - !Sub
+                  - "arn:${AWS::Partition}:bedrock:::foundation-model/${Model}"
+                  - Model: !Join [".", [!Select [1, !Split [".", !Ref ModelId]], !Select [2, !Split [".", !Ref ModelId]]]]
+            - Sid: WriteEditions
+              Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub "${SiteBucket.Arn}/data/*"
+            - Sid: ListSiteBucket # lets a missing manifest return 404 (first run) instead of 403
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt SiteBucket.Arn
+            - Sid: ReadFinnhubKey
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FinnhubKeyParameterName}"
+            - Sid: DecryptFinnhubKeyViaSsm
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+      Events:
+        Editions:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub "${AWS::StackName}-editions"
+            Description: Pre-market, midday and after-the-close editions
+            ScheduleExpression: !Ref ScheduleExpression
+            ScheduleExpressionTimezone: !Ref ScheduleTimezone
+            State: !Ref ScheduleState
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+            Input: '{"source": "schedule"}'
+
+  # ---------------------------------------------------------------- alerts (optional)
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  NewsAgentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: The news agent Lambda failed (no edition was published).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NewsAgentFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  FallbackEditionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: An edition was published without AI summaries (Bedrock step failed).
+      Namespace: StockNewsDashboard
+      MetricName: FallbackEdition
+      Dimensions:
+        - Name: Service
+          Value: news-agent
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  DashboardUrl:
+    Description: Public URL of the dashboard
+    Value: !Sub "https://${Distribution.DomainName}"
+  SiteBucketName:
+    Description: Bucket that holds the site and the editions (data/)
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  NewsAgentFunctionName:
+    Value: !Ref NewsAgentFunction

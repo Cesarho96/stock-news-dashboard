@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Sample Atom Feed</title>
+  <entry>
+    <title>Federal Reserve issues FOMC statement on policy rate</title>
+    <link rel="alternate" href="https://atom.example/press/fomc"/>
+    <updated>2026-11-20T19:00:00Z</updated>
+    <summary type="html">The Committee decided to maintain the target range.</summary>
+  </entry>
+</feed>

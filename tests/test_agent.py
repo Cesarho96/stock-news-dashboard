@@ -1,0 +1,197 @@
+"""Validator, Bedrock client and the agent loop (with a scripted fake Bedrock)."""
+
+import copy
+import json
+
+import pytest
+from conftest import FakeClientError, FakeHttp, ScriptedBedrock, text_response, tool_response
+
+from stocknews.agent import NewsAgent, parse_json_text
+from stocknews.collect import collect_all
+from stocknews.llm import BedrockClaude, LLMError
+from stocknews.tools import ResearchTools
+from stocknews.validate import ValidationContext, validate_analysis
+
+
+@pytest.fixture
+def world(ctx, cfg, settings, fake_fh):
+    snapshot, pool, _ = collect_all(ctx, cfg, settings, fake_fh, None, FakeHttp())
+    return snapshot, pool
+
+
+def ids_for(pool, symbol=None, market=False):
+    if market:
+        return [e.id for e in pool.market_wide() if e.in_window]
+    return [e.id for e in pool.by_ticker(symbol, in_window_only=True)]
+
+
+def good_analysis(cfg, pool, mover="NVDA"):
+    m = ids_for(pool, market=True)
+    return {
+        "headline": "Stocks rise as yields ease",
+        "summary": "Softer inflation data lifted equities.",
+        "top": {
+            "whatHappened": {"title": "Stocks close higher", "paragraph": "The S&P 500 ETF rose.", "evidence": [m[0]]},
+            "keyAlert": {"category": "macro", "title": "Fed signals patience", "whatHappened": "Officials spoke.",
+                         "whyItMatters": "Rates matter.", "tickers": [], "evidence": [m[1]]},
+            "marketMover": {"ticker": mover, "title": "Nvidia gains", "whatHappened": "Shares rose.",
+                            "whyItMatters": "AI demand.", "evidence": ids_for(pool, "NVDA")[:1]},
+        },
+        "latest": [
+            {"theme": "macro", "title": "Oil slips on inventories", "whatHappened": "Crude fell.",
+             "whyItMatters": "Energy names.", "tickers": [], "evidence": [m[3]]},
+            {"theme": "company", "title": "Apple product line", "whatHappened": "New products.",
+             "whyItMatters": "Upgrade cycle.", "tickers": ["AAPL"], "evidence": ids_for(pool, "AAPL")[:1]},
+            {"theme": "company", "title": "Microsoft product line", "whatHappened": "New products.",
+             "whyItMatters": "Cloud.", "tickers": ["MSFT"], "evidence": ids_for(pool, "MSFT")[:1]},
+        ],
+        "watchlist": [{"ticker": w["symbol"], "sentiment": "neutral", "summary": "Quiet day.",
+                       "whatToWatch": "Earnings.", "evidence": ids_for(pool, w["symbol"])[:1]} for w in cfg["watchlist"]],
+        "sectors": [{"sector": "semiconductors", "title": "Chip suppliers rally", "whatHappened": "Gains.",
+                     "whyItMatters": "Demand.", "tickers": ["NVDA"], "evidence": [m[2]]}],
+        "radar": [{"kind": "catalyst", "text": "NVDA reports next week.", "evidence": []}],
+    }
+
+
+def vctx(cfg, pool, snapshot):
+    return ValidationContext(pool=pool, watchlist=[w["symbol"] for w in cfg["watchlist"]],
+                             sector_ids=[s["id"] for s in cfg["sectors"]], quote_lookup=snapshot.quote)
+
+
+# ---- validator ---------------------------------------------------------------------------
+def test_validator_accepts_good_analysis(cfg, world):
+    snapshot, pool = world
+    a = good_analysis(cfg, pool)
+    report = validate_analysis(a, vctx(cfg, pool, snapshot))
+    assert report.ok, report.hard
+    assert len(a["latest"]) == 3 and len(a["watchlist"]) == 4
+
+
+def test_validator_fixes_and_flags(cfg, world):
+    snapshot, pool = world
+    a = good_analysis(cfg, pool)
+    a["top"]["whatHappened"]["evidence"] = ["E999"]  # hallucinated id -> hard
+    a["top"]["marketMover"]["ticker"] = "NOPE"  # no market data -> hard
+    a["latest"].append(copy.deepcopy(a["latest"][0]))  # duplicate -> removed
+    a["latest"][1]["evidence"] = ["E998"]  # unknown only -> removed
+    a["watchlist"] = a["watchlist"][1:] + [{"ticker": "TSLA", "sentiment": "bullish", "summary": "x",
+                                           "whatToWatch": "", "evidence": []}]
+    a["sectors"].append({"sector": "crypto", "title": "x", "whatHappened": "y", "whyItMatters": "z",
+                         "tickers": [], "evidence": []})
+    a["headline"] = "word " * 80
+    report = validate_analysis(a, vctx(cfg, pool, snapshot))
+    hard = " | ".join(str(i) for i in report.hard)
+    assert "top.whatHappened: cite at least one evidence ID" in hard
+    assert "top.marketMover.ticker: no market data for 'NOPE'" in hard
+    assert "missing notes for: AAPL" in hard
+    assert [s["title"] for s in a["latest"]] == ["Oil slips on inventories", "Microsoft product line"]
+    assert all(n["ticker"] != "TSLA" for n in a["watchlist"])
+    assert len(a["sectors"]) == 1
+    assert len(a["headline"]) <= 160
+    assert any("removed unknown evidence id E999" in f for f in report.fixes)
+
+
+def test_validator_drops_story_repeating_top(cfg, world):
+    snapshot, pool = world
+    a = good_analysis(cfg, pool)
+    a["latest"][0]["evidence"] = list(a["top"]["keyAlert"]["evidence"])
+    report = validate_analysis(a, vctx(cfg, pool, snapshot))
+    assert any("repeats the story already used in top.keyAlert" in f for f in report.fixes)
+
+
+def test_parse_json_text_tolerates_fences():
+    assert parse_json_text('Here you go:\n```json\n{"a": 1}\n```') == {"a": 1}
+    assert parse_json_text('prefix {"b": [1,2]} suffix') == {"b": [1, 2]}
+
+
+# ---- Bedrock client ----------------------------------------------------------------------
+def test_llm_request_shape_and_feature_downgrades():
+    fake = ScriptedBedrock([
+        FakeClientError("ValidationException", "output_config.effort: Extra inputs are not permitted"),
+        text_response({"ok": True}),
+    ])
+    llm = BedrockClaude("global.anthropic.claude-sonnet-5-5", "us-east-1", effort="medium", client=fake)
+    resp = llm.create(system="sys", messages=[{"role": "user", "content": "hi"}],
+                      tools=[{"name": "t", "description": "d", "input_schema": {"type": "object"}}],
+                      tool_choice={"type": "none"}, output_schema={"type": "object"})
+    first, second = fake.requests
+    assert first["output_config"] == {"effort": "medium", "format": {"type": "json_schema", "schema": {"type": "object"}}}
+    assert first["thinking"] == {"type": "adaptive"}
+    assert first["tools"][0]["strict"] is True and first["tool_choice"] == {"type": "none"}
+    assert first["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "effort" not in second["output_config"]  # dropped, schema kept
+    assert llm.downgrades == ["effort"] and resp["stop_reason"] == "end_turn"
+    assert llm.usage["calls"] == 1 and llm.estimated_cost(2.0, 10.0) > 0
+
+
+def test_llm_raises_on_access_denied():
+    fake = ScriptedBedrock([FakeClientError("AccessDeniedException", "not authorized")])
+    llm = BedrockClaude("m", "us-east-1", client=fake)
+    with pytest.raises(LLMError, match="AccessDeniedException"):
+        llm.create(system="s", messages=[])
+
+
+# ---- agent loop --------------------------------------------------------------------------
+def test_agent_researches_writes_and_repairs(ctx, cfg, settings, world, fake_fh):
+    snapshot, pool = world
+    tools = ResearchTools(fake_fh, pool, snapshot, ctx, budget=settings.max_tool_calls)
+
+    def research_note(body):
+        # Phase 1 continues the same conversation: tool results came back as a user turn.
+        results = body["messages"][-1]["content"]
+        assert results[0]["type"] == "tool_result" and not results[0]["is_error"]
+        payload = json.loads(results[0]["content"])
+        assert payload["items"][0]["title"].startswith("Super Micro")
+        return text_response("- Lead: yields ease (market)\n- Mover: SMCI")
+
+    def first_draft(body):
+        assert body["tool_choice"] == {"type": "none"}
+        assert body["output_config"]["format"]["type"] == "json_schema"
+        a = good_analysis(cfg, pool, mover="SMCI")
+        a["watchlist"] = a["watchlist"][:-1]  # forget AVGO -> repair round
+        return text_response(a)
+
+    def repaired(body):
+        msg = body["messages"][-1]["content"][0]["text"]
+        assert "missing notes for: AVGO" in msg
+        return text_response(good_analysis(cfg, pool, mover="SMCI"))
+
+    fake = ScriptedBedrock([
+        tool_response(("get_company_news", {"symbol": "SMCI", "days": 2}), ("get_quotes", {"symbols": ["SMCI"]})),
+        research_note, first_draft, repaired,
+    ])
+    llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
+    result = NewsAgent(llm, settings, tools=tools).run(ctx, cfg, snapshot, pool)
+    assert result.report.ok and result.repairs == 1 and result.tool_calls == 2
+    assert result.analysis["top"]["marketMover"]["ticker"] == "SMCI"
+    assert "SMCI" in snapshot.quotes and snapshot.names["SMCI"] == "Super Micro Computer"
+    assert any(e.origin == "tool:SMCI" for e in pool.items.values())
+    # thinking/tool blocks were passed back unchanged in later turns
+    assert fake.requests[1]["messages"][1]["content"][0]["type"] == "tool_use"
+
+
+def test_agent_without_tools_falls_back_to_prompt_schema(ctx, cfg, settings, world):
+    snapshot, pool = world
+    settings.research_tools = False
+    fake = ScriptedBedrock([
+        FakeClientError("ValidationException", "output_config.format: json_schema is not supported for this model"),
+        FakeClientError("ValidationException", "output_config.format: json_schema is not supported for this model"),
+        text_response("```json\n" + json.dumps(good_analysis(cfg, pool)) + "\n```"),
+    ])
+    llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
+    result = NewsAgent(llm, settings, tools=None).run(ctx, cfg, snapshot, pool)
+    assert result.report.ok
+    assert llm.downgrades == ["effort", "format"]
+    assert "output_config" not in fake.requests[-1]
+    assert len(fake.requests[0]["messages"]) == 1  # no research phase
+
+
+def test_agent_stops_when_lambda_time_is_short(ctx, cfg, settings, world, fake_fh):
+    from stocknews.agent import AgentError
+
+    snapshot, pool = world
+    tools = ResearchTools(fake_fh, pool, snapshot, ctx, budget=3)
+    llm = BedrockClaude(settings.model_id, "us-east-1", client=ScriptedBedrock([]))  # no call allowed
+    agent = NewsAgent(llm, settings, tools=tools, deadline=100.0, clock=lambda: 0.0)
+    with pytest.raises(AgentError, match="not enough time"):
+        agent.run(ctx, cfg, snapshot, pool)

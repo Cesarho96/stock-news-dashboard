@@ -1,0 +1,4 @@
+# The Lambda itself has no third-party dependencies (stdlib + the boto3 bundled with the runtime).
+# These are only for running the tests and the live mode on your machine.
+pytest>=8
+boto3>=1.35
