@@ -1,64 +1,85 @@
 # AI Stock News Dashboard
 
-A news dashboard for US large-cap stocks, written by an AI agent and hosted on AWS. Three times per trading day (pre-market, midday, after the close), a Lambda function:
+A news dashboard for the **20 largest S&P 500 companies**, written by an AI agent and run on AWS with LLMOps controls: offline evals before every release, an online quality gate before every edition, operational and quality metrics with alarms, and a fast, automatic rollback to the last validated release.
 
-1. collects prices, company news, market news, earnings dates, SEC filings and RSS headlines,
+Three times per trading day (pre-market, midday, after the close) a Lambda function:
+
+1. ranks the S&P 500 top 20 by market cap and collects their prices, company news, SEC filings, market news, earnings dates and RSS headlines,
 2. lets **Claude Sonnet 5.5 on Amazon Bedrock** research (with tools) and write the edition as schema-validated JSON,
-3. checks every citation against the collected items and asks the model to fix anything that fails,
-4. publishes the edition to a private S3 bucket served by CloudFront.
-
-The page layout and the "the LLM writes data, a fixed renderer draws it" approach come from the *Tablero de Inteligencia Ejecutiva* (`pwa-dashboards-ppl/frontend/public/tablero-ceo`). The Grupo Salinas content, sources and rules were replaced with a stock-market edition. The pipeline is new: an automated Bedrock agent instead of a manual Cowork session.
+3. validates every citation, then runs the **quality gate**: deterministic checks (figures against market data, advice language) and an **LLM judge** (Claude Haiku 5.5) that scores each section's groundedness against its cited evidence,
+4. publishes what passes to a private S3 bucket behind CloudFront (sections that fail are replaced by source headlines), and writes a **run record** that can be replayed as an eval case.
 
 | Section | Content |
 |---|---|
 | Indicator strip | S&P 500, Nasdaq 100, Dow, Russell 2000, Treasuries, gold, oil, dollar (through ETFs) |
-| 01 Top of the day | What happened · Key alert · Market mover |
+| 01 Top of the day | Three cards about top-20 companies only (What happened · Key alert · Market mover) and the **top-20 board**: rank, price, change, market cap and a one-line AI note with its source |
 | 02 Latest news | 4–10 stories grouped by theme (macro, earnings, AI & tech, deals, policy, company) |
-| 03 Your watchlist | One card per ticker: price, news-flow tone, summary, what to watch, headlines, next earnings |
-| 04 Markets | Watchlist movers, sector ETFs, upcoming earnings |
+| 03 Your watchlist | Watchlist tickers **outside** the top 20 (the page is left out when there are none) |
+| 04 Markets | Biggest moves among the top 20 and your watchlist, sector ETFs, upcoming earnings |
 | 05 Sectors | Tabs with sector ETF performance and sector stories |
-| 06 Radar | Catalysts, risks and data to watch, plus how the edition was made |
+| 06 Radar | Catalysts, risks and data to watch, plus how the edition was made and its quality scores |
+
+The top 20 is recomputed every run from Finnhub company profiles (market cap) over a pool of about 40 mega-caps in `agent/stocknews/config/watchlist.json` (`universe.pool`); Alphabet counts once (GOOGL). Index constituents are a paid Finnhub feature, so keep the pool a little larger than 20.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  SCH["EventBridge Scheduler<br/>8:35 · 12:35 · 16:35 New York"] --> L["Lambda: news agent<br/>(Python, no dependencies)"]
-  SSM["SSM SecureString<br/>Finnhub key"] --> L
-  L -->|quotes, news, earnings| FH[Finnhub]
-  L -->|8-K / 10-Q / 10-K| SEC[SEC EDGAR]
-  L -->|headlines| RSS[RSS feeds]
-  L <-->|"research tools + JSON schema"| BR["Claude Sonnet 5.5<br/>Amazon Bedrock"]
-  L -->|"edition JSON + manifest"| S3[("S3 (private)")]
-  S3 --> CF["CloudFront + OAC<br/>security headers"] --> WEB["Browser<br/>dashboard.js"]
+  SCH["EventBridge Scheduler"] --> A["Lambda alias 'live'<br/>news agent version N"]
+  A -->|quotes, profiles, news| FH[Finnhub]
+  A -->|filings| SEC[SEC EDGAR]
+  A -->|headlines| RSS[RSS feeds]
+  A <-->|"research + JSON schema"| W["Claude Sonnet 5.5<br/>(writer)"]
+  A <-->|groundedness verdicts| J["Claude Haiku 5.5<br/>(judge)"]
+  A -->|edition + manifest| S3[("Site bucket<br/>releases/&lt;sha&gt;/ + data/")]
+  A -->|run record| OPS[("Ops bucket<br/>runs/ · evals/ · cache/")]
+  A -->|EMF metrics| CW["CloudWatch<br/>dashboard + alarms"]
+  S3 --> CF[CloudFront] --> WEB[Browser]
+  CW -->|rollback alarms| RB["Auto-rollback Lambda"]
+  RB -->|"alias -> last good<br/>site -> last good"| A
+  REG[("SSM release registry<br/>current · last-good · blocked · kill switch")] <--> A
+  RB <--> REG
 ```
 
-**How the agent stays factual**
+Releases flow through GitHub Actions: **test → package once → eval gate (real models) → dev → production (approval)**. Inside each CloudFormation deployment, a CodeDeploy **PreTraffic hook** runs a smoke edition on the new Lambda version before the `live` alias moves to it. A release then **bakes** in production; after N good editions it becomes the **last good** release, the rollback target. Details, metrics and runbooks: **[docs/llmops.md](docs/llmops.md)**.
 
-- Every collected article or filing gets an ID (`E001`, `E002`, …). The model sees IDs, headlines and short summaries; it never sees or writes URLs. Code fills in the links, sources and timestamps from the collected data, so the page cannot show a made-up link.
-- Prices and percentage moves come from market data, not from the model.
-- The edition is generated with Bedrock **structured outputs** (JSON schema), and the research tools use **strict tool use**.
-- `validate.py` then checks the result: unknown IDs, stories without evidence from the news window, a story repeated across sections, missing watchlist tickers, and a mover without a quote. Safe problems are fixed automatically. The rest are sent back to the model for up to two repair rounds.
-- If Bedrock fails (access, throttling, timeout), the run still publishes a **fallback edition**: market data plus source headlines, clearly labeled.
-- Feed text is treated as untrusted data (prompt-injection rule in the system prompt), and the renderer escapes everything under a strict Content-Security-Policy.
+### Where the fast rollback lives
+
+Every release is a **Lambda version** (immutable: code, prompts, schema, config and model ids together) plus a **site release** under `releases/<git-sha>/` in the site bucket. Production serves whatever the `live` alias and the root `index.html` point to, and the **release registry** in SSM Parameter Store (`/stock-news-dashboard/prod/release/last-good`) records the last validated pair. Rolling back is moving two pointers, which takes seconds:
+
+- **Automatic:** while a release bakes, the `-rb-` alarms (agent errors, fallback edition, quality gate withheld, low groundedness) trigger the auto-rollback Lambda, which restores the last good version and site, blocks the bad release and emails you.
+- **One click:** GitHub → Actions → **operate** → `rollback` (also from the GitHub mobile app), or `python scripts/release.py rollback --env prod --reason "..."`.
+- **Without a deployment:** the AI **kill switch** (`operate` → `ai-off`) publishes data-and-headlines editions until you turn it back on, and `withdraw` removes a bad edition from the page.
+
+## How the agent stays factual
+
+- Every collected article or filing gets an ID (`E001`, …). The model sees IDs, headlines and short summaries; it never sees or writes URLs. Code fills in links, sources and timestamps, so the page cannot show a made-up link.
+- Prices, % moves and market caps come from market data. The deterministic checks flag any figure in the AI text that matches neither the quotes of the companies mentioned nor the cited evidence.
+- Bedrock **structured outputs** (JSON schema) and **strict tool use**; the top-20 tickers are schema enums, so the model cannot put a non-top-20 company in "Top of the day".
+- `validate.py` fixes what is safe (unknown IDs, duplicates, over-long text) and sends the rest back for up to two repair rounds (missing top-20 notes, top cards not about the top 20, stories without fresh evidence…).
+- The **quality gate** withholds sections the judge rates unsupported, sections with unverified figures or advice language, and the whole AI text when groundedness falls under the floor. The page then shows source headlines in their place and says so.
+- If Bedrock fails, the run still publishes a clearly labeled **fallback edition** (market data + headlines). Feed text is treated as untrusted data, and the renderer escapes everything under a strict Content-Security-Policy.
 
 ## Project layout
 
 ```
-agent/stocknews/        Lambda package (stdlib + the boto3 bundled with the Lambda runtime)
-  config/watchlist.json   watchlist, indicator strip, sectors, RSS feeds, limits   <- edit this
-  collect.py finnhub.py sec.py rss.py   data collection
-  evidence.py           evidence pool (IDs, dedupe, news window)
-  agent.py llm.py tools.py prompts.py schema.py   Bedrock agent (research -> write -> repair)
-  validate.py compose.py publish.py pipeline.py handler.py
-  demo.py local_run.py  offline demo and local runs
-web/                    static site (index.html, assets/dashboard.js, assets/dashboard.css)
-template.yaml           AWS SAM / CloudFormation stack
-samconfig.toml          deploy defaults
-scripts/deploy.ps1|.sh  deploy stack + upload site (+ optional first run)
-tests/                  pytest suite (fake Bedrock/Finnhub) and renderer tests (node)
-.github/workflows/      CI tests + optional deploy through GitHub OIDC
-run_local.py            python run_local.py --demo | --live
+agent/stocknews/          Lambda package (stdlib + the boto3 bundled with the runtime)
+  config/watchlist.json     top-20 pool, watchlist, strip, sectors, RSS feeds, limits   <- edit this
+  collect.py finnhub.py sec.py rss.py market.py   collection and the top-20 ranking
+  agent.py llm.py tools.py prompts.py schema.py validate.py   Bedrock agent (research -> write -> repair)
+  quality.py                deterministic checks and the runtime quality gate
+  evals/                    LLM judge, datasets (seed + captured runs), metrics, eval runner, thresholds.json
+  runrecord.py registry.py ops.py   run records, release registry, smoke hook, rollback
+  compose.py publish.py pipeline.py handler.py demo.py local_run.py
+web/                      static site (index.html, assets/dashboard.js, assets/dashboard.css)
+template.yaml             app stack (one per environment): site, agent, smoke hook, rollback, alarms, dashboard
+infra/bootstrap.yaml      one-time account setup: GitHub OIDC roles, CloudFormation role, buckets, budget
+infra/params/dev.json     per-environment parameters (prod.json for production)
+scripts/deploy.py         bootstrap | package | app | site | release | run | validate
+scripts/release.py        status | rollback | kill-switch | withdraw | capture | history | ...
+.github/workflows/        ci, evals, release (CD), operate (incident actions)
+docs/llmops.md            LLMOps design, metrics, alarms and runbooks
+tests/                    pytest suite (fake Bedrock/Finnhub/AWS) and renderer tests (node)
 ```
 
 ## 1. Try it locally (no keys needed)
@@ -69,100 +90,104 @@ python -m http.server 8000 --directory web
 # open http://localhost:8000
 ```
 
-The demo edition is synthetic placeholder content (every headline starts with `[Demo]`, links go to example.com, and a banner says so). It exists only to preview the layout.
+The demo edition is synthetic placeholder content (headlines start with `[Demo]`, links go to example.com, and a banner says so).
 
 ## 2. Deploy to AWS
 
-Prerequisites: AWS CLI v2 and AWS SAM CLI, signed in to your account (`aws configure` or SSO). The steps below use `us-east-1`. Any region where the Claude inference profile is available works.
+Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM CLI and credentials for your account. The steps use `us-east-1`.
 
-1. **Enable Claude on Bedrock (one time per account).** In the Bedrock console, open the model catalog, pick **Claude Sonnet 5.5** and open it in the playground. The first time, Bedrock asks for Anthropic's short use-case form. Send one test prompt; that also creates the AWS Marketplace subscription, so the Lambda role only needs `bedrock:InvokeModel`.
-2. **Get a free Finnhub API key** at finnhub.io and store it in Parameter Store:
+1. **Enable the models on Bedrock (once per account).** In the Bedrock console open **Claude Sonnet 5.5** and **Claude Haiku 5.5** in the playground; the first time, Bedrock asks for Anthropic's use-case form. Send one test prompt to each.
+2. **Store your Finnhub key** (free at finnhub.io):
    ```powershell
    aws ssm put-parameter --region us-east-1 --type SecureString `
      --name /stock-news-dashboard/finnhub-api-key --value "YOUR_FINNHUB_KEY"
    ```
-3. **Deploy** (first time guided; it saves your answers to `samconfig.toml`):
+3. **Bootstrap the account** (GitHub OIDC roles, CloudFormation execution role, artifacts and ops buckets, monthly budget). Add `--create-oidc-provider` if the account has no GitHub OIDC provider yet:
    ```powershell
-   .\scripts\deploy.ps1 -Guided
+   python scripts/deploy.py bootstrap --github-repo Cesarho96/stock-news-dashboard --email you@example.com --create-oidc-provider
    ```
-   Set `SecUserAgent` to something like `Your Name you@example.com` to enable SEC filings (the SEC requires a contact header). Set `AlarmEmail` to get emailed if a run fails, then confirm the SNS email.
-4. **Publish the first edition now** instead of waiting for the schedule:
+4. **Deploy.** Through GitHub (recommended, see section 3), or from your machine:
    ```powershell
-   .\scripts\deploy.ps1 -RunNow
+   $env:ALARM_EMAIL = "you@example.com"; $env:SEC_USER_AGENT = "Your Name you@example.com"
+   python scripts/deploy.py release --env dev     # package + stack + site
+   python scripts/deploy.py run --env dev         # publish an edition now
    ```
-   After 2–5 minutes, open the `Dashboard:` URL printed by the script (a `*.cloudfront.net` address).
+   Confirm the SNS subscription email. `scripts/deploy.ps1 -Env dev -RunNow` does the same from PowerShell.
 
-Bash users: `./scripts/deploy.sh --guided`, then `./scripts/deploy.sh --run-now`.
+The first deployment creates the stack directly; every later deployment goes through the CodeDeploy smoke gate.
 
-No `sam build` step is needed: the function has no third-party packages, so `sam deploy` uploads `agent/` as is.
+### Stack parameters (`infra/params/<env>.json`)
 
-### Stack parameters
-
-| Parameter | Default | Notes |
+| Parameter | prod | Notes |
 |---|---|---|
-| `ModelId` | `global.anthropic.claude-sonnet-5-5` | Bedrock inference profile. `us.anthropic.claude-sonnet-5-5` keeps processing in US regions. `global.anthropic.claude-haiku-5-5` is much cheaper. |
-| `Effort` | `medium` | Claude effort level (`low`…`max`, or `none` for the model default). |
-| `Language` | `en` | `es` writes the edition and labels in Spanish. |
-| `Watchlist` | empty | Comma-separated tickers that replace the configured watchlist, e.g. `AAPL,MSFT,NVDA,AMD`. |
-| `ScheduleExpression` | `cron(35 8,12,16 ? * MON-FRI *)` | Evaluated in `ScheduleTimezone` (`America/New_York`, so DST is handled). In US winter that is 7:35, 11:35 and 15:35 in Mexico City. |
-| `ScheduleState` | `ENABLED` | `DISABLED` pauses the agent (and its costs). |
-| `SecUserAgent` | empty | Enables SEC EDGAR filings. |
-| `AlarmEmail` | empty | Creates alarms for Lambda errors and fallback editions. |
+| `ModelId` | `global.anthropic.claude-sonnet-5-5` | Writer model (Bedrock inference profile). |
+| `JudgeModelId` / `JudgeEnabled` | `global.anthropic.claude-haiku-5-5` / `true` | LLM judge used by the quality gate. |
+| `QualityFloor` / `QualityTarget` | `0.6` / `0.8` | Groundedness under the floor withholds all AI text; under the target the edition is marked degraded. |
+| `BakeEditions` | `3` | Good editions before a release becomes the rollback target (dev: 1). |
+| `SmokeTest` / `AutoRollback` | `ENABLED` | Deployment smoke gate and automatic rollback during the bake. |
+| `Effort`, `Language`, `Watchlist` | `medium`, `en`, empty | As before (`Language=es` writes in Spanish). |
+| `ScheduleExpression` | `cron(35 8,12,16 ? * MON-FRI *)` | New York time (dev: once a day after the close). |
+| `DailyCostAlarmUsd`, `MinEvidenceItems` | `3`, `40` | Cost and data-source alarms. |
 
-Change the watchlist, strip, sectors or feeds in `agent/stocknews/config/watchlist.json` and redeploy. Tickers outside the configured list work too: unknown names fall back to the symbol, and you can add `name`, `sector` and `aliases` for better matching.
+`AlarmEmail` and `SecUserAgent` come from the `ALARM_EMAIL` / `SEC_USER_AGENT` environment variables (GitHub variables in CI). A change to any parameter is a release like any other: it goes through the eval gate, the smoke test and the bake.
 
-## 3. Run the real pipeline on your machine
+## 3. CI/CD with GitHub Actions
+
+| Workflow | When | What |
+|---|---|---|
+| `ci` | every PR and branch push | ruff, pytest, renderer tests, cfn-lint + SAM transform check |
+| `evals` | PRs touching `agent/stocknews/**`, Mondays, manual | real-model evals on the seed and golden datasets; fails on the gate |
+| `release` | push to `main` | test → package → eval gate → dev → production (approval) |
+| `operate` | manual | status, rollback, AI kill switch, withdraw an edition, run an edition |
+
+Setup (once): run the bootstrap (section 2), then in the repository settings:
+
+1. **Variables:** `AWS_ROLE_ARN` (bootstrap output `DeployRoleArn`), `AWS_EVALS_ROLE_ARN` (`EvalsRoleArn`), `OPS_BUCKET` (`OpsBucketName`), and optionally `AWS_REGION`, `ALARM_EMAIL`, `SEC_USER_AGENT`, `RUNNER_LABEL` (e.g. `self-hosted`), `EVALS_MAX_CASES`.
+2. **Environments:** create `dev` and `production`; on `production` add yourself as a required reviewer (and optionally restrict it to the `main` branch).
+3. **Branch protection on `main`:** require the `ci` check (and `evals` if you want the eval gate on every PR).
+
+Work on a branch, open a PR (ci + evals run), merge, approve the production deployment.
+
+## 4. Run the real pipeline and the evals on your machine
 
 ```powershell
 $env:FINNHUB_API_KEY = "YOUR_FINNHUB_KEY"
-$env:SEC_USER_AGENT  = "Your Name you@example.com"   # optional
-$env:AWS_PROFILE     = "default"                     # credentials with bedrock:InvokeModel
-python run_local.py --live            # writes web/data, then preview with http.server
-python run_local.py --live --no-llm   # test the collectors without calling Bedrock
+$env:AWS_PROFILE     = "default"                 # credentials with bedrock:InvokeModel
+python run_local.py --live                       # writes web/data and a run record in .runs/
+python run_local.py --live --no-llm              # collectors only
+cd agent
+python -m stocknews.evals --params ../infra/params/prod.json --dataset seed: --dataset ../.runs/runs/ --gate gate
 ```
 
-Other environment variables: `MODEL_ID`, `BEDROCK_REGION`, `EFFORT`, `LANGUAGE`, `WATCHLIST`, `RESEARCH_TOOLS`, `MAX_TOOL_CALLS`, `MAX_REPAIRS`, `PRICE_INPUT_MTOK` and `PRICE_OUTPUT_MTOK` (used for the cost estimate). Local runs need `pip install boto3`; the tests need `pip install -r requirements-dev.txt`.
+The eval report prints as Markdown (groundedness, validity, unverified figures, coverage, cost, latency per case).
 
 ## Costs (estimate)
 
-- **Bedrock** is the main cost. With Claude Sonnet 5.5 at Anthropic's list price of $2 / $10 per million input/output tokens, one edition uses roughly 30–60K input tokens (mostly cached) and 8–15K output tokens. That is about **$0.15–0.30 per edition**, or **$10–20 a month** at 3 editions per trading day. Haiku 5.5 costs a fraction of that. Bedrock rates can differ by endpoint (global vs. geo profiles), so check the Bedrock pricing page. Each run logs its token use and an estimated cost (also published as CloudWatch metrics).
-- **Lambda, S3, CloudFront, EventBridge Scheduler, Parameter Store:** typically within the free tiers for a personal dashboard (a few cents a month for logs at most).
-- **Finnhub:** free plan (about 60 calls/minute). A run makes about 45 calls.
-
-## Operations
-
-- **Logs:** CloudWatch log group `/aws/lambda/<stack>-news-agent` (30-day retention).
-- **Metrics:** namespace `StockNewsDashboard`: `FallbackEdition`, `DegradedEdition`, `EvidenceItems`, `InputTokens`, `OutputTokens`, `EstimatedCostUsd`, `RunSeconds`.
-- **Re-run an edition (bash):** `aws lambda invoke --function-name <stack>-news-agent --invocation-type Event --cli-binary-format raw-in-base64-out --payload '{"slot":"close"}' out.json`. The same edition ID is replaced and the history is kept.
-- **History:** the last 120 editions stay in the timeline (`data/manifest.json`). Older edition files remain in S3.
-- **Pause:** redeploy with `ScheduleState=DISABLED`.
-- **Remove:** `sam delete --stack-name stock-news-dashboard`. The site bucket is retained on purpose; empty it and delete it if you no longer need the history.
-
-### Optional CI/CD (GitHub Actions)
-
-`.github/workflows/ci-deploy.yml` runs the tests on every push and pull request. To deploy `main` automatically, create an IAM role for GitHub OIDC that can deploy this stack, then set the repository variable `AWS_DEPLOY_ROLE_ARN`. Optional variables: `AWS_REGION`, `STACK_NAME`, and `RUNNER_LABEL` (for example `self-hosted`). The deploy job uses `aws-actions/setup-sam`, which needs a Linux x86_64 runner.
+- **Bedrock:** one edition is about 30–60K input tokens (mostly cached) and 8–15K output tokens for the writer, about $0.15–0.30 with Sonnet 5.5 at list price, plus about $0.01–0.03 for the Haiku judge. Three editions per trading day ≈ **$10–20/month** in prod; dev adds about $4/month; each deployment smoke test and eval run costs about the same as one edition per case. Check the Bedrock pricing page for your endpoint. Every run logs and publishes its estimated cost.
+- **Lambda, S3, CloudFront, Scheduler, Parameter Store, CodeDeploy:** typically within the free tiers. CloudWatch custom metrics (about 25 per environment) and alarms cost a few dollars a month.
+- **Finnhub:** free plan (about 60 calls/minute); a run makes about 90 calls, plus 40 profile calls once a day.
 
 ## Security notes
 
-- The S3 bucket is private, with public access blocked. Only CloudFront can read it (Origin Access Control), and only over TLS.
-- CloudFront sends a strict Content-Security-Policy (no inline scripts or styles), HSTS, `nosniff`, `DENY` framing and a referrer policy. `index.html` carries the same CSP as a meta tag, so local previews enforce it too.
-- The renderer HTML-escapes all data and only links `http(s)` URLs, with `rel="noopener noreferrer"`.
-- The Finnhub key lives in SSM Parameter Store (SecureString) and is sent as a header, never in URLs or logs.
-- The Lambda role can only invoke the configured model, read (and decrypt through SSM) that one parameter, list the site bucket and read/write objects under `data/`.
-- The dashboard is public to anyone with the CloudFront URL. To restrict it, add CloudFront signed cookies, Cognito, or a WAF IP allow list.
+- CI uses **GitHub OIDC** (no stored AWS keys). The deploy role can only hand a scoped CloudFormation execution role to CloudFormation, write release artifacts, and operate the app's functions, registry and site; production deployments need an environment approval. The evals role can only call Bedrock and read eval data.
+- The site bucket is private (CloudFront Origin Access Control, TLS only, versioned). CloudFront sends a strict Content-Security-Policy, HSTS, `nosniff`, `DENY` framing and a referrer policy; the renderer escapes all data and only links `http(s)` URLs.
+- The Finnhub key lives in SSM Parameter Store (SecureString) and is sent as a header. The agent's role can only invoke the configured writer and judge models.
+- Run records and eval datasets contain third-party news text; they stay in the private ops bucket and are not committed to git.
 
 ## Data and usage terms
 
-- Finnhub's free plan is for personal, non-commercial use. Making the dashboard public for an organization or a business needs a paid plan.
-- News content belongs to its publishers. The dashboard shows headlines, short AI-written summaries and links to the original articles. Review each source's terms before redistributing at scale.
-- AI summaries can contain mistakes. The page says so and links every story to its source. Nothing here is investment advice.
+- Finnhub's free plan is for personal, non-commercial use; a public or business dashboard needs a paid plan.
+- News content belongs to its publishers. The dashboard shows headlines, short AI-written summaries and links to the original articles.
+- AI summaries can contain mistakes. The page says so, links every story to its source and publishes its quality scores. Nothing here is investment advice.
 
 ## Tests
 
 ```powershell
 pip install -r requirements-dev.txt
+ruff check agent tests scripts
 python -m pytest
 node --test tests/web/renderer.test.mjs
+python scripts/deploy.py validate
 ```
 
-The Python suite drives the whole pipeline with a scripted fake Bedrock client (tool calls, validation failures, repair rounds, feature downgrades, fallback editions) and fake market data. No network or AWS credentials are needed.
+The Python suite drives the whole pipeline with scripted fakes for Bedrock (writer and judge), Finnhub and AWS: tool calls, repair rounds, the quality gate (withheld sections, data-only editions), eval gates and regressions, run-record replay, the release registry bake, the smoke hook and both rollback paths. No network or AWS credentials needed.

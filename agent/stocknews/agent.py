@@ -20,11 +20,11 @@ from . import prompts
 from .clock import EditionContext
 from .evidence import EvidencePool
 from .llm import BedrockClaude, LLMError
-from .market import MarketSnapshot
+from .market import MarketSnapshot, coverage
 from .schema import analysis_schema, tool_definitions
 from .settings import Settings
 from .tools import ResearchTools
-from .validate import Report, ValidationContext, validate_analysis
+from .validate import Issue, Report, ValidationContext, validate_analysis
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,9 @@ class AgentResult:
     tool_calls: int = 0
     research_note: str = ""
     notes: list[str] = field(default_factory=list)
+    first_report: Report | None = None  # validation of the first draft (before any repair)
+    prompt_fingerprint: str = ""
+    llm_seconds: float = 0.0
 
 
 def _text_of(content: list) -> str:
@@ -75,9 +78,11 @@ class NewsAgent:
         return float("inf") if self.deadline is None else self.deadline - self.clock()
 
     def run(self, ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot, pool: EvidencePool) -> AgentResult:
-        watch = [w["symbol"] for w in cfg["watchlist"]]
+        started = self.clock()
+        top20, extras = coverage(cfg, snapshot)
         sector_ids = [s["id"] for s in cfg.get("sectors", [])]
-        schema = analysis_schema(watch, sector_ids)
+        schema = analysis_schema(top20, extras, sector_ids)
+        fingerprint = prompts.prompt_fingerprint(ctx.language, analysis_schema(["TOP"], ["EXTRA"], sector_ids))
         system = prompts.system_prompt(ctx.language)
         use_tools = bool(self.tools and self.settings.research_tools and self.settings.max_tool_calls > 0)
         tool_defs = tool_definitions() if use_tools else None
@@ -123,11 +128,12 @@ class NewsAgent:
 
         # ---- phase 2: write + validate + repair ---------------------------------------
         vctx = ValidationContext(
-            pool=pool, watchlist=watch, sector_ids=sector_ids,
+            pool=pool, watchlist=extras, sector_ids=sector_ids, top20=top20,
             quote_lookup=(self.tools.ensure_quote if self.tools else snapshot.quote),
         )
         analysis: dict | None = None
         report = Report()
+        first_report: Report | None = None
         repairs = 0
         notes: list[str] = []
         for attempt in range(self.settings.max_repairs + 1):
@@ -151,6 +157,9 @@ class NewsAgent:
                 problems = [str(i) for i in report.hard]
             except (json.JSONDecodeError, ValueError) as exc:
                 problems = [f"$: the response was not valid JSON ({exc})"]
+                report = Report(issues=[Issue("$", f"not valid JSON ({exc})")])
+            if first_report is None:
+                first_report = report
             if not problems:
                 break
             log.warning("validation round %d: %d problems: %s", attempt, len(problems), problems[:5])
@@ -170,7 +179,8 @@ class NewsAgent:
         return AgentResult(
             analysis=analysis, report=report, repairs=repairs,
             tool_calls=self.tools.calls if self.tools else 0,
-            research_note=research_note, notes=notes,
+            research_note=research_note, notes=notes, first_report=first_report,
+            prompt_fingerprint=fingerprint, llm_seconds=round(self.clock() - started, 1),
         )
 
 

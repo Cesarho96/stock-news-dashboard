@@ -4,11 +4,13 @@ import copy
 import json
 
 import pytest
-from conftest import FakeClientError, FakeHttp, ScriptedBedrock, text_response, tool_response
+from conftest import FakeClientError, FakeHttp, ScriptedBedrock, text_response, tool_response, valid_analysis
 
 from stocknews.agent import NewsAgent, parse_json_text
 from stocknews.collect import collect_all
 from stocknews.llm import BedrockClaude, LLMError
+from stocknews.market import coverage
+from stocknews.schema import analysis_schema
 from stocknews.tools import ResearchTools
 from stocknews.validate import ValidationContext, validate_analysis
 
@@ -25,75 +27,68 @@ def ids_for(pool, symbol=None, market=False):
     return [e.id for e in pool.by_ticker(symbol, in_window_only=True)]
 
 
-def good_analysis(cfg, pool, mover="NVDA"):
-    m = ids_for(pool, market=True)
-    return {
-        "headline": "Stocks rise as yields ease",
-        "summary": "Softer inflation data lifted equities.",
-        "top": {
-            "whatHappened": {"title": "Stocks close higher", "paragraph": "The S&P 500 ETF rose.", "evidence": [m[0]]},
-            "keyAlert": {"category": "macro", "title": "Fed signals patience", "whatHappened": "Officials spoke.",
-                         "whyItMatters": "Rates matter.", "tickers": [], "evidence": [m[1]]},
-            "marketMover": {"ticker": mover, "title": "Nvidia gains", "whatHappened": "Shares rose.",
-                            "whyItMatters": "AI demand.", "evidence": ids_for(pool, "NVDA")[:1]},
-        },
-        "latest": [
-            {"theme": "macro", "title": "Oil slips on inventories", "whatHappened": "Crude fell.",
-             "whyItMatters": "Energy names.", "tickers": [], "evidence": [m[3]]},
-            {"theme": "company", "title": "Apple product line", "whatHappened": "New products.",
-             "whyItMatters": "Upgrade cycle.", "tickers": ["AAPL"], "evidence": ids_for(pool, "AAPL")[:1]},
-            {"theme": "company", "title": "Microsoft product line", "whatHappened": "New products.",
-             "whyItMatters": "Cloud.", "tickers": ["MSFT"], "evidence": ids_for(pool, "MSFT")[:1]},
-        ],
-        "watchlist": [{"ticker": w["symbol"], "sentiment": "neutral", "summary": "Quiet day.",
-                       "whatToWatch": "Earnings.", "evidence": ids_for(pool, w["symbol"])[:1]} for w in cfg["watchlist"]],
-        "sectors": [{"sector": "semiconductors", "title": "Chip suppliers rally", "whatHappened": "Gains.",
-                     "whyItMatters": "Demand.", "tickers": ["NVDA"], "evidence": [m[2]]}],
-        "radar": [{"kind": "catalyst", "text": "NVDA reports next week.", "evidence": []}],
-    }
+def good_analysis(cfg, pool, snapshot, mover=None):
+    return valid_analysis(snapshot, pool, cfg, mover=mover)
 
 
 def vctx(cfg, pool, snapshot):
-    return ValidationContext(pool=pool, watchlist=[w["symbol"] for w in cfg["watchlist"]],
+    top20, extras = coverage(cfg, snapshot)
+    return ValidationContext(pool=pool, watchlist=extras, top20=top20,
                              sector_ids=[s["id"] for s in cfg["sectors"]], quote_lookup=snapshot.quote)
 
 
 # ---- validator ---------------------------------------------------------------------------
 def test_validator_accepts_good_analysis(cfg, world):
     snapshot, pool = world
-    a = good_analysis(cfg, pool)
+    a = good_analysis(cfg, pool, snapshot)
     report = validate_analysis(a, vctx(cfg, pool, snapshot))
     assert report.ok, report.hard
-    assert len(a["latest"]) == 3 and len(a["watchlist"]) == 4
+    assert len(a["latest"]) == 4 and [n["ticker"] for n in a["top20"]] == snapshot.top20
+    assert [n["ticker"] for n in a["watchlist"]] == ["NFLX"]
 
 
 def test_validator_fixes_and_flags(cfg, world):
     snapshot, pool = world
-    a = good_analysis(cfg, pool)
+    a = good_analysis(cfg, pool, snapshot)
     a["top"]["whatHappened"]["evidence"] = ["E999"]  # hallucinated id -> hard
-    a["top"]["marketMover"]["ticker"] = "NOPE"  # no market data -> hard
+    a["top"]["marketMover"]["ticker"] = "NOPE"  # not a top-20 company -> hard
     a["latest"].append(copy.deepcopy(a["latest"][0]))  # duplicate -> removed
     a["latest"][1]["evidence"] = ["E998"]  # unknown only -> removed
-    a["watchlist"] = a["watchlist"][1:] + [{"ticker": "TSLA", "sentiment": "bullish", "summary": "x",
-                                           "whatToWatch": "", "evidence": []}]
+    a["top20"] = a["top20"][1:] + [{"ticker": "TSLA", "sentiment": "bullish", "note": "x", "evidence": []},
+                                   {"ticker": "SMCI", "sentiment": "bullish", "note": "x", "evidence": []}]
+    a["watchlist"].append({"ticker": "AAPL", "sentiment": "mixed", "summary": "in the top 20", "whatToWatch": "",
+                           "evidence": []})
     a["sectors"].append({"sector": "crypto", "title": "x", "whatHappened": "y", "whyItMatters": "z",
                          "tickers": [], "evidence": []})
     a["headline"] = "word " * 80
     report = validate_analysis(a, vctx(cfg, pool, snapshot))
     hard = " | ".join(str(i) for i in report.hard)
     assert "top.whatHappened: cite at least one evidence ID" in hard
-    assert "top.marketMover.ticker: no market data for 'NOPE'" in hard
-    assert "missing notes for: AAPL" in hard
-    assert [s["title"] for s in a["latest"]] == ["Oil slips on inventories", "Microsoft product line"]
-    assert all(n["ticker"] != "TSLA" for n in a["watchlist"])
-    assert len(a["sectors"]) == 1
+    assert "top.marketMover.ticker: 'NOPE' is not in the TOP 20" in hard
+    assert f"top20: missing notes for: {snapshot.top20[0]}" in hard
+    assert [n["ticker"] for n in a["top20"]] == snapshot.top20[1:]  # SMCI dropped, rank order restored
+    assert [n["ticker"] for n in a["watchlist"]] == ["NFLX"]  # AAPL is not an extra
+    assert len(a["latest"]) == 3 and len(a["sectors"]) == 0
     assert len(a["headline"]) <= 160
     assert any("removed unknown evidence id E999" in f for f in report.fixes)
 
 
+def test_validator_top_cards_must_be_about_top20(cfg, world):
+    snapshot, pool = world
+    a = good_analysis(cfg, pool, snapshot)
+    macro = [e.id for e in pool.market_wide() if e.in_window and not e.tickers]
+    a["top"]["keyAlert"].update(tickers=[], evidence=macro[:1])  # Fed story: no top-20 company
+    a["top"]["marketMover"]["ticker"] = "NFLX"  # extra watchlist ticker, not top 20
+    report = validate_analysis(a, vctx(cfg, pool, snapshot))
+    hard = " | ".join(str(i) for i in report.hard)
+    assert "top.keyAlert.tickers: Top of the day must be about TOP 20 companies" in hard
+    assert "top.keyAlert: cite at least one evidence item about a TOP 20 company" in hard
+    assert "top.marketMover.ticker: 'NFLX' is not in the TOP 20" in hard
+
+
 def test_validator_drops_story_repeating_top(cfg, world):
     snapshot, pool = world
-    a = good_analysis(cfg, pool)
+    a = good_analysis(cfg, pool, snapshot)
     a["latest"][0]["evidence"] = list(a["top"]["keyAlert"]["evidence"])
     report = validate_analysis(a, vctx(cfg, pool, snapshot))
     assert any("repeats the story already used in top.keyAlert" in f for f in report.fixes)
@@ -102,6 +97,15 @@ def test_validator_drops_story_repeating_top(cfg, world):
 def test_parse_json_text_tolerates_fences():
     assert parse_json_text('Here you go:\n```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json_text('prefix {"b": [1,2]} suffix') == {"b": [1, 2]}
+
+
+def test_schema_is_stable_across_rankings():
+    a = analysis_schema(["NVDA", "AAPL"], ["NFLX"], ["technology"])
+    b = analysis_schema(["AAPL", "NVDA"], ["NFLX"], ["technology"])
+    assert a == b  # enums are sorted: a re-ranking alone does not invalidate Bedrock's schema cache
+    assert "watchlist" not in analysis_schema(["AAPL"], [], ["technology"])["properties"]
+    empty = analysis_schema([], [], ["technology"])  # no market data this run: no empty enums
+    assert "enum" not in empty["properties"]["top"]["properties"]["marketMover"]["properties"]["ticker"]
 
 
 # ---- Bedrock client ----------------------------------------------------------------------
@@ -142,19 +146,24 @@ def test_agent_researches_writes_and_repairs(ctx, cfg, settings, world, fake_fh)
         assert results[0]["type"] == "tool_result" and not results[0]["is_error"]
         payload = json.loads(results[0]["content"])
         assert payload["items"][0]["title"].startswith("Super Micro")
-        return text_response("- Lead: yields ease (market)\n- Mover: SMCI")
+        briefing = body["messages"][0]["content"][0]["text"]
+        assert "TOP 20 (largest S&P 500 companies by market cap" in briefing and "| NVDA | NVIDIA |" in briefing
+        return text_response("- Lead: NVDA\n- Mover: TSLA")
 
     def first_draft(body):
         assert body["tool_choice"] == {"type": "none"}
         assert body["output_config"]["format"]["type"] == "json_schema"
-        a = good_analysis(cfg, pool, mover="SMCI")
-        a["watchlist"] = a["watchlist"][:-1]  # forget AVGO -> repair round
+        schema = body["output_config"]["format"]["schema"]
+        assert schema["properties"]["top"]["properties"]["marketMover"]["properties"]["ticker"]["enum"] == sorted(
+            snapshot.top20)
+        a = good_analysis(cfg, pool, snapshot, mover="TSLA")
+        a["top20"] = a["top20"][:-1]  # forget the 20th company -> repair round
         return text_response(a)
 
     def repaired(body):
         msg = body["messages"][-1]["content"][0]["text"]
-        assert "missing notes for: AVGO" in msg
-        return text_response(good_analysis(cfg, pool, mover="SMCI"))
+        assert f"missing notes for: {snapshot.top20[-1]}" in msg
+        return text_response(good_analysis(cfg, pool, snapshot, mover="TSLA"))
 
     fake = ScriptedBedrock([
         tool_response(("get_company_news", {"symbol": "SMCI", "days": 2}), ("get_quotes", {"symbols": ["SMCI"]})),
@@ -163,7 +172,9 @@ def test_agent_researches_writes_and_repairs(ctx, cfg, settings, world, fake_fh)
     llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
     result = NewsAgent(llm, settings, tools=tools).run(ctx, cfg, snapshot, pool)
     assert result.report.ok and result.repairs == 1 and result.tool_calls == 2
-    assert result.analysis["top"]["marketMover"]["ticker"] == "SMCI"
+    assert result.first_report is not None and not result.first_report.ok
+    assert result.analysis["top"]["marketMover"]["ticker"] == "TSLA"
+    assert len(result.prompt_fingerprint) == 12
     assert "SMCI" in snapshot.quotes and snapshot.names["SMCI"] == "Super Micro Computer"
     assert any(e.origin == "tool:SMCI" for e in pool.items.values())
     # thinking/tool blocks were passed back unchanged in later turns
@@ -176,7 +187,7 @@ def test_agent_without_tools_falls_back_to_prompt_schema(ctx, cfg, settings, wor
     fake = ScriptedBedrock([
         FakeClientError("ValidationException", "output_config.format: json_schema is not supported for this model"),
         FakeClientError("ValidationException", "output_config.format: json_schema is not supported for this model"),
-        text_response("```json\n" + json.dumps(good_analysis(cfg, pool)) + "\n```"),
+        text_response("```json\n" + json.dumps(good_analysis(cfg, pool, snapshot)) + "\n```"),
     ])
     llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
     result = NewsAgent(llm, settings, tools=None).run(ctx, cfg, snapshot, pool)

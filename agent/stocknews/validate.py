@@ -31,9 +31,10 @@ class Issue:
 @dataclass
 class ValidationContext:
     pool: EvidencePool
-    watchlist: list[str]
+    watchlist: list[str]  # extra watchlist tickers (outside the top 20)
     sector_ids: list[str]
     quote_lookup: Callable[[str], dict | None]
+    top20: list[str] = field(default_factory=list)
     min_latest: int = 3
     max_latest: int = 12
     max_per_sector: int = 2
@@ -98,6 +99,46 @@ def _in_window(ids: list[str], ctx: ValidationContext) -> bool:
     return any(ctx.pool.get(i) and ctx.pool.get(i).in_window for i in ids)
 
 
+def _about_top20(ids: list[str], ctx: ValidationContext) -> bool:
+    top = set(ctx.top20)
+    return any(ctx.pool.get(i) and top.intersection(ctx.pool.get(i).tickers) for i in ids)
+
+
+def _notes(a: dict, key: str, symbols: list[str], text_key: str, report: Report, ctx: ValidationContext,
+           extra_text: str | None = None) -> None:
+    """One note per symbol: drop unknown/duplicate entries, flag missing ones (hard)."""
+    notes = a.get(key)
+    if not isinstance(notes, list):
+        if symbols:
+            report.issues.append(Issue(key, "missing list of notes"))
+        notes = []
+    by_symbol: dict[str, dict] = {}
+    for i, note in enumerate(notes):
+        path = f"{key}[{i}]"
+        if not isinstance(note, dict):
+            continue
+        sym = str(note.get("ticker", "")).strip().upper()
+        if sym not in symbols:
+            report.fixes.append(f"{path}: removed note for {sym or '?'} (not in {key})")
+            continue
+        if sym in by_symbol:
+            report.fixes.append(f"{path}: removed duplicate note for {sym}")
+            continue
+        note["ticker"] = sym
+        if note.get("sentiment") not in SENTIMENTS:
+            note["sentiment"] = "neutral"
+        _text(note, text_key, LIMITS["field"], path, report)
+        if extra_text:
+            _text(note, extra_text, LIMITS["field"], path, report, required=False)
+        _evidence(note, path, ctx, report)
+        by_symbol[sym] = note
+    missing = [s for s in symbols if s not in by_symbol]
+    if missing:
+        report.issues.append(Issue(key, "missing notes for: " + ", ".join(missing)))
+    if symbols or key in a:
+        a[key] = [by_symbol[s] for s in symbols if s in by_symbol]
+
+
 def validate_analysis(a: Any, ctx: ValidationContext) -> Report:
     report = Report()
     if not isinstance(a, dict):
@@ -125,21 +166,29 @@ def validate_analysis(a: Any, ctx: ValidationContext) -> Report:
         else:
             _text(block, "whatHappened", LIMITS["field"], path, report)
             _text(block, "whyItMatters", LIMITS["field"], path, report)
-        if key == "keyAlert":
-            if block.get("category") not in ALERT_CATEGORIES:
-                block["category"] = "alert"
-            _tickers(block)
+        if key == "keyAlert" and block.get("category") not in ALERT_CATEGORIES:
+            block["category"] = "alert"
+        if key != "marketMover":
+            tickers = _tickers(block)
+            if ctx.top20 and not set(tickers).intersection(ctx.top20):
+                report.issues.append(Issue(f"{path}.tickers",
+                                           "Top of the day must be about TOP 20 companies; list at least one TOP 20 ticker"))
         ids = _evidence(block, path, ctx, report)
         if not ids:
             report.issues.append(Issue(path, "cite at least one evidence ID that exists in the EVIDENCE list"))
-        elif key != "marketMover" and not _in_window(ids, ctx):
-            report.issues.append(Issue(path, "must cite at least one NEW item from this news window"))
+        else:
+            if key != "marketMover" and not _in_window(ids, ctx):
+                report.issues.append(Issue(path, "must cite at least one NEW item from this news window"))
+            if ctx.top20 and not _about_top20(ids, ctx):
+                report.issues.append(Issue(path, "cite at least one evidence item about a TOP 20 company"))
         if ids:
             leads.setdefault(ids[0], path)
         if key == "marketMover":
             sym = str(block.get("ticker", "")).strip().upper()
             block["ticker"] = sym
-            if not _TICKER.match(sym) or not ctx.quote_lookup(sym):
+            if ctx.top20 and sym not in ctx.top20:
+                report.issues.append(Issue(f"{path}.ticker", f"'{sym}' is not in the TOP 20; pick a TOP 20 ticker"))
+            elif not _TICKER.match(sym) or not ctx.quote_lookup(sym):
                 report.issues.append(Issue(f"{path}.ticker",
                                            f"no market data for '{sym}'; pick a ticker from MARKET DATA"))
 
@@ -187,34 +236,12 @@ def validate_analysis(a: Any, ctx: ValidationContext) -> Report:
         report.issues.append(Issue("latest", f"only {len(kept)} valid stories; write at least "
                                              f"{ctx.min_latest} distinct stories citing NEW evidence"))
 
-    # ---- watchlist ------------------------------------------------------------------
-    notes = a.get("watchlist")
-    if not isinstance(notes, list):
-        report.issues.append(Issue("watchlist", "missing list of notes"))
-        notes = []
-    by_symbol: dict[str, dict] = {}
-    for i, note in enumerate(notes):
-        path = f"watchlist[{i}]"
-        if not isinstance(note, dict):
-            continue
-        sym = str(note.get("ticker", "")).strip().upper()
-        if sym not in ctx.watchlist:
-            report.fixes.append(f"{path}: removed note for {sym or '?'} (not in the watchlist)")
-            continue
-        if sym in by_symbol:
-            report.fixes.append(f"{path}: removed duplicate note for {sym}")
-            continue
-        note["ticker"] = sym
-        if note.get("sentiment") not in SENTIMENTS:
-            note["sentiment"] = "neutral"
-        _text(note, "summary", LIMITS["field"], path, report)
-        _text(note, "whatToWatch", LIMITS["field"], path, report, required=False)
-        _evidence(note, path, ctx, report)
-        by_symbol[sym] = note
-    missing = [s for s in ctx.watchlist if s not in by_symbol]
-    if missing:
-        report.issues.append(Issue("watchlist", "missing notes for: " + ", ".join(missing)))
-    a["watchlist"] = [by_symbol[s] for s in ctx.watchlist if s in by_symbol]
+    # ---- top-20 notes and extra watchlist notes ----------------------------------------
+    _notes(a, "top20", ctx.top20, "note", report, ctx)
+    if ctx.watchlist:
+        _notes(a, "watchlist", ctx.watchlist, "summary", report, ctx, extra_text="whatToWatch")
+    elif "watchlist" in a:
+        a.pop("watchlist")
 
     # ---- sectors --------------------------------------------------------------------
     sectors = a.get("sectors") if isinstance(a.get("sectors"), list) else []
@@ -272,7 +299,7 @@ def cited_ids(a: dict) -> list[str]:
 
     for block in (a.get("top") or {}).values():
         take(block)
-    for key in ("latest", "watchlist", "sectors", "radar"):
+    for key in ("top20", "latest", "watchlist", "sectors", "radar"):
         for item in a.get(key) or []:
             take(item)
     return out

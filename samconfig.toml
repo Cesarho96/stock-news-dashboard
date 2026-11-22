@@ -1,15 +1,11 @@
-# Defaults for `sam deploy` (run from the project root).
-# To enable SEC filings and email alerts, add to parameter_overrides, for example:
-#   SecUserAgent=\"Your Name you@example.com\" AlarmEmail=\"you@example.com\"
+# Deployments go through scripts/deploy.py (or the GitHub release workflow), which passes every
+# option explicitly: stack name per environment (stock-news-dashboard-dev / -prod), parameters
+# from infra/params/<env>.json, the artifacts bucket and the CloudFormation execution role.
+# Only shared defaults live here; keep deploy options out of this file so they cannot conflict.
 version = 0.1
 
 [default.global.parameters]
-stack_name = "stock-news-dashboard"
-
-[default.deploy.parameters]
 region = "us-east-1"
-capabilities = "CAPABILITY_IAM"
-resolve_s3 = true
-confirm_changeset = true
-fail_on_empty_changeset = false
-parameter_overrides = "ModelId=\"global.anthropic.claude-sonnet-5-5\" Effort=\"medium\" Language=\"en\" ScheduleState=\"ENABLED\" FinnhubKeyParameterName=\"/stock-news-dashboard/finnhub-api-key\""
+
+[default.validate.parameters]
+lint = true

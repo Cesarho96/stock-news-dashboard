@@ -46,6 +46,15 @@ class Finnhub:
         )
 
     def quote(self, symbol: str) -> dict | None:
+        """Latest quote. Share-class tickers are retried with a dash (BRK.B -> BRK-B)."""
+        q = self._quote(symbol)
+        if q is None and "." in symbol:
+            q = self._quote(symbol.replace(".", "-"))
+            if q:
+                q["symbol"] = symbol
+        return q
+
+    def _quote(self, symbol: str) -> dict | None:
         data = self._get("/quote", symbol=symbol)
         if not isinstance(data, dict):
             return None
@@ -95,6 +104,8 @@ class Finnhub:
 
     def profile(self, symbol: str) -> dict | None:
         data = self._get("/stock/profile2", symbol=symbol)
+        if not (isinstance(data, dict) and data.get("name")) and "." in symbol:
+            data = self._get("/stock/profile2", symbol=symbol.replace(".", "-"))
         return data if isinstance(data, dict) and data.get("name") else None
 
 

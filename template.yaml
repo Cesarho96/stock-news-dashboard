@@ -1,28 +1,86 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  AI stock news dashboard. A scheduled Lambda news agent collects market data and news,
-  asks Claude on Amazon Bedrock to write a validated edition, and publishes JSON to a
-  private S3 bucket served through CloudFront.
+  AI stock news dashboard, one environment (dev or prod). A scheduled Lambda news agent collects
+  market data and news for the S&P 500 top 20, writes a validated edition with Claude on Amazon
+  Bedrock, checks it with an LLM judge and deterministic quality gates, and publishes JSON to a
+  private S3 bucket served through CloudFront. New releases pass a CodeDeploy smoke gate, bake in
+  production and roll back automatically to the last validated release when quality alarms fire.
+  Deploy with scripts/deploy.py (needs the bootstrap stack: infra/bootstrap.yaml).
 
 Parameters:
+  AppName:
+    Type: String
+    Default: stock-news-dashboard
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: Short name used for the SSM release registry (/<AppName>/<Environment>/...).
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  ReleaseId:
+    Type: String
+    Default: manual
+    AllowedPattern: "^[A-Za-z0-9._-]{1,64}$"
+    Description: Git commit SHA of this release (set by scripts/deploy.py). Recorded in every edition and run record.
+  OpsBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: Operations bucket from the bootstrap stack (run records, eval datasets and reports, caches).
   ModelId:
     Type: String
     Default: global.anthropic.claude-sonnet-5-5
     AllowedPattern: "^[a-z]+\\.[a-z0-9-]+\\.[A-Za-z0-9.:-]+$"
-    Description: >
-      Bedrock inference profile ID (prefix.provider.model), e.g. global.anthropic.claude-sonnet-5-5,
-      us.anthropic.claude-sonnet-5-5 or global.anthropic.claude-haiku-5-5 (cheaper).
+    Description: Bedrock inference profile of the writer model, e.g. global.anthropic.claude-sonnet-5-5.
   Effort:
     Type: String
     Default: medium
     AllowedValues: [low, medium, high, xhigh, max, none]
-    Description: Claude effort level (how much it thinks). "none" uses the model default.
+    Description: Claude effort level for the writer. "none" uses the model default.
+  JudgeModelId:
+    Type: String
+    Default: global.anthropic.claude-haiku-5-5
+    AllowedPattern: "^[a-z]+\\.[a-z0-9-]+\\.[A-Za-z0-9.:-]+$"
+    Description: Bedrock inference profile of the LLM judge (groundedness checks before publishing).
+  JudgeEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  QualityFloor:
+    Type: String
+    Default: "0.6"
+    AllowedPattern: "^(0(\\.[0-9]+)?|1(\\.0+)?)$"
+    Description: Judge groundedness below this withholds all AI text (data-only edition).
+  QualityTarget:
+    Type: String
+    Default: "0.8"
+    AllowedPattern: "^(0(\\.[0-9]+)?|1(\\.0+)?)$"
+    Description: Judge groundedness below this marks the edition degraded (and feeds the quality alarm).
+  BakeEditions:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: Good editions a new release must publish before it becomes the rollback target ("last good").
+  SmokeTest:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: CodeDeploy PreTraffic smoke test (the new version writes the seed edition with the real models).
+  AutoRollback:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Roll back to the last good release when a rollback alarm fires during the bake window.
+  RegenerateAfterRollback:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Publish a fresh edition with the restored release right after an automatic rollback.
   Language:
     Type: String
     Default: en
     AllowedValues: [en, es]
-    Description: Language of the AI-written text and dashboard labels.
   Watchlist:
     Type: String
     Default: ""
@@ -50,7 +108,15 @@ Parameters:
   AlarmEmail:
     Type: String
     Default: ""
-    Description: Optional email for failure alerts (confirm the SNS subscription email).
+    Description: Email for alarms, rollbacks and blocked deployments (confirm the SNS subscription email).
+  DailyCostAlarmUsd:
+    Type: Number
+    Default: 3
+    Description: Alarm when the estimated Bedrock spend of one day exceeds this amount (USD).
+  MinEvidenceItems:
+    Type: Number
+    Default: 40
+    Description: Alarm when an edition collected fewer evidence items than this (a news source is down).
   PriceClass:
     Type: String
     Default: PriceClass_100
@@ -58,6 +124,7 @@ Parameters:
 
 Conditions:
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  SmokeEnabled: !Equals [!Ref SmokeTest, ENABLED]
 
 Resources:
   # ---------------------------------------------------------------- static site
@@ -66,6 +133,14 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      VersioningConfiguration:
+        Status: Enabled # every manifest and index.html change can be restored
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -167,20 +242,30 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-news-agent"
-      RetentionInDays: 30
+      RetentionInDays: 90
 
   NewsAgentFunction:
     Type: AWS::Serverless::Function
     DependsOn: NewsAgentLogGroup
     Properties:
       FunctionName: !Sub "${AWS::StackName}-news-agent"
-      Description: Collects market news, writes the edition with Claude on Bedrock, publishes to S3.
+      Description: Collects market news for the S&P 500 top 20, writes the edition with Claude on Bedrock, publishes to S3.
       CodeUri: agent/
       Handler: stocknews.handler.lambda_handler
       Runtime: python3.13
       Architectures: [arm64]
       MemorySize: 512
       Timeout: 900
+      # Every deployment publishes an immutable version (code + prompts + config + model ids) and
+      # moves the `live` alias to it through CodeDeploy, after the smoke test passes.
+      AutoPublishAlias: live
+      VersionDescription: !Sub "release ${ReleaseId}"
+      DeploymentPreference:
+        Type: AllAtOnce # a scheduled job has no live traffic to shift gradually; the gate is the smoke test
+        Hooks:
+          PreTraffic: !Ref PreTrafficHookFunction
+        Alarms:
+          - !Ref NewsAgentErrorsAlarm
       EventInvokeConfig:
         MaximumRetryAttempts: 0 # a retry would mean a second paid LLM run
         MaximumEventAgeInSeconds: 3600
@@ -195,20 +280,36 @@ Resources:
           FINNHUB_KEY_PARAM: !Ref FinnhubKeyParameterName
           SEC_USER_AGENT: !Ref SecUserAgent
           LOG_LEVEL: INFO
+          ENVIRONMENT: !Ref Environment
+          RELEASE_ID: !Ref ReleaseId
+          OPS_BUCKET: !Ref OpsBucketName
+          JUDGE_ENABLED: !Ref JudgeEnabled
+          JUDGE_MODEL_ID: !Ref JudgeModelId
+          QUALITY_FLOOR: !Ref QualityFloor
+          QUALITY_TARGET: !Ref QualityTarget
+          BAKE_EDITIONS: !Ref BakeEditions
+          REGISTRY_PREFIX: !Sub "/${AppName}/${Environment}"
       Policies:
         - Version: "2012-10-17"
           Statement:
-            - Sid: InvokeClaudeOnBedrock
+            - Sid: InvokeClaudeOnBedrock # writer and judge models
               Effect: Allow
               Action: bedrock:InvokeModel
               Resource:
                 - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/${ModelId}"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/${JudgeModelId}"
                 - !Sub
                   - "arn:${AWS::Partition}:bedrock:*::foundation-model/${Model}"
                   - Model: !Join [".", [!Select [1, !Split [".", !Ref ModelId]], !Select [2, !Split [".", !Ref ModelId]]]]
                 - !Sub
                   - "arn:${AWS::Partition}:bedrock:::foundation-model/${Model}"
                   - Model: !Join [".", [!Select [1, !Split [".", !Ref ModelId]], !Select [2, !Split [".", !Ref ModelId]]]]
+                - !Sub
+                  - "arn:${AWS::Partition}:bedrock:*::foundation-model/${Model}"
+                  - Model: !Join [".", [!Select [1, !Split [".", !Ref JudgeModelId]], !Select [2, !Split [".", !Ref JudgeModelId]]]]
+                - !Sub
+                  - "arn:${AWS::Partition}:bedrock:::foundation-model/${Model}"
+                  - Model: !Join [".", [!Select [1, !Split [".", !Ref JudgeModelId]], !Select [2, !Split [".", !Ref JudgeModelId]]]]
             - Sid: WriteEditions
               Effect: Allow
               Action: [s3:GetObject, s3:PutObject]
@@ -217,6 +318,16 @@ Resources:
               Effect: Allow
               Action: s3:ListBucket
               Resource: !GetAtt SiteBucket.Arn
+            - Sid: RunRecordsAndCaches
+              Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource:
+                - !Sub "arn:${AWS::Partition}:s3:::${OpsBucketName}/runs/${Environment}/*"
+                - !Sub "arn:${AWS::Partition}:s3:::${OpsBucketName}/cache/${Environment}/*"
+            - Sid: ReleaseRegistryAndKillSwitch
+              Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/${Environment}/*"
             - Sid: ReadFinnhubKey
               Effect: Allow
               Action: ssm:GetParameter
@@ -243,25 +354,160 @@ Resources:
               MaximumRetryAttempts: 0
             Input: '{"source": "schedule"}'
 
-  # ---------------------------------------------------------------- alerts (optional)
+  # ---------------------------------------------------------------- release safety
+  PreTrafficHookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/CodeDeployHook_${AWS::StackName}-pretraffic"
+      RetentionInDays: 90
+
+  PreTrafficHookFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PreTrafficHookLogGroup
+    Properties:
+      # The CodeDeployHook_ prefix lets CodeDeploy's managed role invoke it.
+      FunctionName: !Sub "CodeDeployHook_${AWS::StackName}-pretraffic"
+      Description: Smoke-tests a new news-agent version (seed edition, real models) before it takes traffic.
+      CodeUri: agent/
+      Handler: stocknews.ops.pre_traffic_handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 900
+      DeploymentPreference:
+        Enabled: false
+      Environment:
+        Variables:
+          NEW_VERSION: !Ref NewsAgentFunction.Version
+          SMOKE_ENABLED: !If [SmokeEnabled, "true", "false"]
+          REGISTRY_PREFIX: !Sub "/${AppName}/${Environment}"
+          RELEASE_ID: !Ref ReleaseId
+          TOPIC_ARN: !Ref AlertTopic
+          STACK_NAME: !Ref AWS::StackName
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReportHookStatus
+              Effect: Allow
+              Action: codedeploy:PutLifecycleEventHookExecutionStatus
+              Resource: !Sub "arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ServerlessDeploymentApplication}/*"
+            - Sid: InvokeNewVersion
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "${NewsAgentFunction.Arn}:*"
+            - Sid: ReleaseRegistry
+              Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/${Environment}/*"
+            - Sid: Notify
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
+
+  AutoRollbackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-auto-rollback"
+      RetentionInDays: 90
+
+  AutoRollbackFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: AutoRollbackLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-auto-rollback"
+      Description: On a rollback alarm during the bake window, restores the last validated release and notifies.
+      CodeUri: agent/
+      Handler: stocknews.ops.auto_rollback_handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          FUNCTION_NAME: !Ref NewsAgentFunction
+          ALIAS: live
+          SITE_BUCKET: !Ref SiteBucket
+          DISTRIBUTION_ID: !Ref Distribution
+          REGISTRY_PREFIX: !Sub "/${AppName}/${Environment}"
+          TOPIC_ARN: !Ref AlertTopic
+          STACK_NAME: !Ref AWS::StackName
+          AUTO_ROLLBACK: !Ref AutoRollback
+          REGENERATE_AFTER_ROLLBACK: !Ref RegenerateAfterRollback
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: MoveLiveAlias
+              Effect: Allow
+              Action: [lambda:GetAlias, lambda:UpdateAlias]
+              Resource:
+                - !GetAtt NewsAgentFunction.Arn
+                - !Sub "${NewsAgentFunction.Arn}:*"
+            - Sid: RegenerateEdition
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "${NewsAgentFunction.Arn}:live"
+            - Sid: RestoreSiteRelease
+              Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource:
+                - !Sub "${SiteBucket.Arn}/releases/*"
+                - !Sub "${SiteBucket.Arn}/index.html"
+            - Sid: InvalidateIndex
+              Effect: Allow
+              Action: cloudfront:CreateInvalidation
+              Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+            - Sid: ReleaseRegistry
+              Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/${Environment}/*"
+            - Sid: Notify
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
+      Events:
+        RollbackAlarms:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.cloudwatch]
+              detail-type: [CloudWatch Alarm State Change]
+              resources:
+                - !GetAtt NewsAgentErrorsAlarm.Arn
+                - !GetAtt FallbackEditionAlarm.Arn
+                - !GetAtt QualityWithheldAlarm.Arn
+                - !GetAtt LowGroundednessAlarm.Arn
+              detail:
+                state:
+                  value: [ALARM]
+
+  # ---------------------------------------------------------------- alerts
   AlertTopic:
     Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AWS::StackName} alerts"
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
     Condition: HasAlarmEmail
     Properties:
-      Subscription:
-        - Protocol: email
-          Endpoint: !Ref AlarmEmail
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
 
+  # Rollback alarms (name prefix "-rb-"): during a release's bake window they trigger the
+  # automatic rollback; afterwards they only notify.
   NewsAgentErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HasAlarmEmail
     Properties:
-      AlarmDescription: The news agent Lambda failed (no edition was published).
+      AlarmName: !Sub "${AWS::StackName}-rb-agent-errors"
+      AlarmDescription: A scheduled run of the news agent failed (no edition was published).
       Namespace: AWS/Lambda
       MetricName: Errors
-      Dimensions:
+      Dimensions: # only invocations through the live alias (smoke tests invoke a version directly)
         - Name: FunctionName
           Value: !Ref NewsAgentFunction
+        - Name: Resource
+          Value: !Sub "${NewsAgentFunction}:live"
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -272,14 +518,14 @@ Resources:
 
   FallbackEditionAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: HasAlarmEmail
     Properties:
-      AlarmDescription: An edition was published without AI summaries (Bedrock step failed).
+      AlarmName: !Sub "${AWS::StackName}-rb-fallback-edition"
+      AlarmDescription: An edition was published without AI text (the AI step failed). Runbook docs/llmops.md.
       Namespace: StockNewsDashboard
       MetricName: FallbackEdition
       Dimensions:
-        - Name: Service
-          Value: news-agent
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -288,14 +534,280 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 
+  QualityWithheldAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rb-quality-withheld"
+      AlarmDescription: The quality gate withheld all AI text of an edition (groundedness under the floor or advice language).
+      Namespace: StockNewsDashboard
+      MetricName: WithheldByGate
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  LowGroundednessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rb-low-groundedness"
+      AlarmDescription: Judge groundedness stayed under the quality target in two consecutive 6-hour windows.
+      Namespace: StockNewsDashboard
+      MetricName: Groundedness
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Average
+      Period: 21600
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref QualityTarget
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: ignore
+      AlarmActions: [!Ref AlertTopic]
+
+  # Notification alarms (preventive signals; no automatic action).
+  DegradedEditionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-degraded-editions"
+      AlarmDescription: Two or more editions in a day had AI sections withheld or unresolved validation issues.
+      Namespace: StockNewsDashboard
+      MetricName: DegradedEdition
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  UnverifiedFiguresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-unverified-figures"
+      AlarmDescription: Five or more figures in a day matched neither market data nor the cited evidence (hallucination drift).
+      Namespace: StockNewsDashboard
+      MetricName: UnverifiedNumbers
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  JudgeErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-judge-errors"
+      AlarmDescription: The LLM judge failed twice in a day; editions were checked by rules only.
+      Namespace: StockNewsDashboard
+      MetricName: JudgeError
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  DailyCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-daily-cost"
+      AlarmDescription: Estimated Bedrock spend (writer + judge) of the last day is above the budget.
+      Namespace: StockNewsDashboard
+      MetricName: EstimatedCostUsd
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref DailyCostAlarmUsd
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  LowEvidenceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-low-evidence"
+      AlarmDescription: An edition collected too few news items (a data source is failing).
+      Namespace: StockNewsDashboard
+      MetricName: EvidenceItems
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Minimum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref MinEvidenceItems
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  SlowRunsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-slow-runs"
+      AlarmDescription: An edition took more than 13 minutes (the Lambda timeout is 15).
+      Namespace: StockNewsDashboard
+      MetricName: RunSeconds
+      Dimensions:
+        - {Name: Service, Value: news-agent}
+        - {Name: Environment, Value: !Ref Environment}
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 780
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  AutoRollbackErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-auto-rollback-errors"
+      AlarmDescription: The automatic rollback function failed. Roll back by hand (scripts/release.py rollback).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AutoRollbackFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ---------------------------------------------------------------- observability
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-llmops"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type": "text", "x": 0, "y": 0, "width": 24, "height": 2, "properties": {"markdown": "## ${AWS::StackName}: LLMOps\nEditions, quality (LLM judge + deterministic checks), cost and latency of the news agent. Release registry: SSM `/${AppName}/${Environment}/release/*`. Runbook: docs/llmops.md in the repository."}},
+              {"type": "metric", "x": 0, "y": 2, "width": 8, "height": 6, "properties": {"title": "Editions by outcome (per day)", "view": "timeSeries", "stacked": true, "region": "${AWS::Region}", "stat": "Sum", "period": 86400, "metrics": [
+                ["StockNewsDashboard", "EditionPublished", "Service", "news-agent", "Environment", "${Environment}", {"label": "published"}],
+                [".", "DegradedEdition", ".", ".", ".", ".", {"label": "degraded"}],
+                [".", "FallbackEdition", ".", ".", ".", ".", {"label": "fallback (no AI text)"}],
+                [".", "WithheldByGate", ".", ".", ".", ".", {"label": "withheld by the gate"}]]}},
+              {"type": "metric", "x": 8, "y": 2, "width": 8, "height": 6, "properties": {"title": "Quality: judge groundedness and top-20 coverage", "view": "timeSeries", "region": "${AWS::Region}", "period": 21600, "yAxis": {"left": {"min": 0, "max": 1}}, "annotations": {"horizontal": [{"label": "target", "value": ${QualityTarget}}, {"label": "floor", "value": ${QualityFloor}, "color": "#d62728"}]}, "metrics": [
+                ["StockNewsDashboard", "Groundedness", "Service", "news-agent", "Environment", "${Environment}", {"stat": "Average", "label": "groundedness (avg)"}],
+                ["...", {"stat": "Minimum", "label": "groundedness (min)"}],
+                [".", "Top20Coverage", ".", ".", ".", ".", {"stat": "Average", "label": "top-20 notes coverage"}]]}},
+              {"type": "metric", "x": 16, "y": 2, "width": 8, "height": 6, "properties": {"title": "Hallucination signals (per day)", "view": "timeSeries", "region": "${AWS::Region}", "stat": "Sum", "period": 86400, "metrics": [
+                ["StockNewsDashboard", "UnverifiedNumbers", "Service", "news-agent", "Environment", "${Environment}", {"label": "unverified figures"}],
+                [".", "UnsupportedSections", ".", ".", ".", ".", {"label": "judge: unsupported sections"}],
+                [".", "CitationErrors", ".", ".", ".", ".", {"label": "invented evidence ids"}],
+                [".", "SectionsWithheld", ".", ".", ".", ".", {"label": "sections withheld"}],
+                [".", "AdviceFlags", ".", ".", ".", ".", {"label": "advice language"}]]}},
+              {"type": "metric", "x": 0, "y": 8, "width": 8, "height": 6, "properties": {"title": "Cost (USD per day) and tokens", "view": "timeSeries", "region": "${AWS::Region}", "stat": "Sum", "period": 86400, "metrics": [
+                ["StockNewsDashboard", "EstimatedCostUsd", "Service", "news-agent", "Environment", "${Environment}", {"label": "estimated cost USD"}],
+                [".", "InputTokens", ".", ".", ".", ".", {"label": "input tokens", "yAxis": "right"}],
+                [".", "OutputTokens", ".", ".", ".", ".", {"label": "output tokens", "yAxis": "right"}]]}},
+              {"type": "metric", "x": 8, "y": 8, "width": 8, "height": 6, "properties": {"title": "Latency and agent effort", "view": "timeSeries", "region": "${AWS::Region}", "period": 3600, "metrics": [
+                ["StockNewsDashboard", "RunSeconds", "Service", "news-agent", "Environment", "${Environment}", {"stat": "Maximum", "label": "run seconds (max)"}],
+                [".", "LlmSeconds", ".", ".", ".", ".", {"stat": "Maximum", "label": "LLM seconds (max)"}],
+                [".", "RepairRounds", ".", ".", ".", ".", {"stat": "Sum", "label": "repair rounds", "yAxis": "right"}],
+                [".", "ToolCalls", ".", ".", ".", ".", {"stat": "Sum", "label": "research tool calls", "yAxis": "right"}]]}},
+              {"type": "metric", "x": 16, "y": 8, "width": 8, "height": 6, "properties": {"title": "Data sources", "view": "timeSeries", "region": "${AWS::Region}", "period": 3600, "metrics": [
+                ["StockNewsDashboard", "EvidenceItems", "Service", "news-agent", "Environment", "${Environment}", {"stat": "Minimum", "label": "evidence items (min)"}],
+                [".", "SourceErrors", ".", ".", ".", ".", {"stat": "Sum", "label": "source errors", "yAxis": "right"}]]}},
+              {"type": "alarm", "x": 0, "y": 14, "width": 12, "height": 5, "properties": {"title": "Alarms (rb- = triggers automatic rollback while a release bakes)", "alarms": ["${ErrorsArn}", "${FallbackArn}", "${WithheldArn}", "${GroundednessArn}", "${DegradedArn}", "${UnverifiedArn}", "${JudgeArn}", "${CostArn}", "${EvidenceArn}", "${SlowArn}", "${RollbackErrArn}"]}},
+              {"type": "log", "x": 12, "y": 14, "width": 12, "height": 5, "properties": {"title": "Latest editions", "region": "${AWS::Region}", "view": "table", "query": "SOURCE '/aws/lambda/${AWS::StackName}-news-agent' | fields @timestamp, Edition, Status, Gate, Groundedness, UnverifiedNumbers, Release, EstimatedCostUsd | filter ispresent(EditionPublished) | sort @timestamp desc | limit 20"}}
+            ]
+          }
+        - ErrorsArn: !GetAtt NewsAgentErrorsAlarm.Arn
+          FallbackArn: !GetAtt FallbackEditionAlarm.Arn
+          WithheldArn: !GetAtt QualityWithheldAlarm.Arn
+          GroundednessArn: !GetAtt LowGroundednessAlarm.Arn
+          DegradedArn: !GetAtt DegradedEditionsAlarm.Arn
+          UnverifiedArn: !GetAtt UnverifiedFiguresAlarm.Arn
+          JudgeArn: !GetAtt JudgeErrorsAlarm.Arn
+          CostArn: !GetAtt DailyCostAlarm.Arn
+          EvidenceArn: !GetAtt LowEvidenceAlarm.Arn
+          SlowArn: !GetAtt SlowRunsAlarm.Arn
+          RollbackErrArn: !GetAtt AutoRollbackErrorsAlarm.Arn
+
+  EditionsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${AWS::StackName}/editions"
+      LogGroupNames: [!Ref NewsAgentLogGroup]
+      QueryString: |
+        fields @timestamp, Edition, Status, Gate, Groundedness, UnverifiedNumbers, SectionsWithheld, Release, EstimatedCostUsd, RunSeconds
+        | filter ispresent(EditionPublished)
+        | sort @timestamp desc
+        | limit 50
+
+  QualityByReleaseQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${AWS::StackName}/quality-by-release"
+      LogGroupNames: [!Ref NewsAgentLogGroup]
+      QueryString: |
+        filter ispresent(EditionPublished)
+        | stats count(*) as editions, avg(Groundedness) as groundedness, min(Groundedness) as worst,
+                sum(UnverifiedNumbers) as unverified, sum(FallbackEdition) as fallbacks,
+                sum(DegradedEdition) as degraded, avg(EstimatedCostUsd) as cost by Release
+        | sort editions desc
+
+  AiFailuresQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${AWS::StackName}/ai-failures"
+      LogGroupNames: [!Ref NewsAgentLogGroup]
+      QueryString: |
+        fields @timestamp, @message
+        | filter @message like /AI step failed|judge failed|validation round|quality gate|Bedrock rejected/
+        | sort @timestamp desc
+        | limit 100
+
 Outputs:
   DashboardUrl:
     Description: Public URL of the dashboard
     Value: !Sub "https://${Distribution.DomainName}"
+  OperationsDashboardUrl:
+    Description: CloudWatch dashboard with the LLMOps metrics and alarms
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${AWS::StackName}-llmops"
   SiteBucketName:
-    Description: Bucket that holds the site and the editions (data/)
+    Description: Bucket that holds the site releases and the editions (data/)
     Value: !Ref SiteBucket
   DistributionId:
     Value: !Ref Distribution
   NewsAgentFunctionName:
     Value: !Ref NewsAgentFunction
+  NewsAgentLiveAlias:
+    Description: The alias the schedule invokes; rollbacks move it
+    Value: !Ref NewsAgentFunction.Alias
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  RegistryPrefix:
+    Description: SSM path of the release registry and the AI kill switch
+    Value: !Sub "/${AppName}/${Environment}"
+  Environment:
+    Value: !Ref Environment
+  ReleaseId:
+    Value: !Ref ReleaseId

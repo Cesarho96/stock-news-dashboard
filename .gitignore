@@ -6,3 +6,8 @@ __pycache__/
 .env
 # Local editions written by run_local.py (production editions live in S3)
 web/data/
+# Local caches, run records and eval reports
+.cache/
+.runs/
+.evals/
+.build/

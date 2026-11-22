@@ -1,0 +1,35 @@
+{
+  "gate": {
+    "description": "Release gate. CI runs the candidate release on the eval datasets before deploying it; every check must pass.",
+    "checks": {
+      "final_valid_rate": {"min": 1.0},
+      "first_pass_valid_rate": {"min": 0.5},
+      "groundedness_mean": {"min": 0.85},
+      "groundedness_min": {"min": 0.65},
+      "judged_rate": {"min": 1.0},
+      "top20_coverage_mean": {"min": 0.95},
+      "unverified_numbers_mean": {"max": 1.0},
+      "advice_flags_total": {"max": 0},
+      "citation_error_rate": {"max": 0.05},
+      "withhold_rate": {"max": 0.0},
+      "cost_usd_mean": {"max": 0.75},
+      "seconds_p95": {"max": 600}
+    },
+    "regression": {
+      "description": "Allowed drop against the baseline report (the last good release).",
+      "groundedness_mean": 0.05,
+      "first_pass_valid_rate": 0.34,
+      "top20_coverage_mean": 0.05
+    }
+  },
+  "smoke": {
+    "description": "Deployment smoke test (CodeDeploy PreTraffic hook): the new Lambda version writes the seed edition with the real models before it takes traffic.",
+    "checks": {
+      "final_valid_rate": {"min": 1.0},
+      "groundedness_min": {"min": 0.6},
+      "top20_coverage_mean": {"min": 0.9},
+      "advice_flags_total": {"max": 0},
+      "withhold_rate": {"max": 0.0}
+    }
+  }
+}

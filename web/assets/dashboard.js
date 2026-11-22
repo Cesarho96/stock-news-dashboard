@@ -25,7 +25,7 @@
       fallback: 'AI summary unavailable.',
       fallbackText: 'This edition shows market data and source headlines only.',
       degraded: 'Partially validated.',
-      degradedText: 'Some AI sections did not pass validation and were replaced with source headlines.',
+      degradedText: 'Some AI sections did not pass validation or the quality checks and were replaced with source headlines.',
       historyBanner: 'You are reading an earlier edition:',
       goLatest: 'Go to the latest edition',
       newEdition: 'A newer edition is available.',
@@ -40,7 +40,8 @@
       headlines: 'Latest headlines',
       noHeadlines: 'No headlines in this window.',
       indicators: 'Key indicators',
-      summary: 'Summary'
+      summary: 'Summary',
+      release: 'release'
     },
     es: {
       sources: 'Fuentes',
@@ -61,7 +62,7 @@
       fallback: 'Resumen IA no disponible.',
       fallbackText: 'Esta edición muestra solo datos de mercado y titulares de las fuentes.',
       degraded: 'Validación parcial.',
-      degradedText: 'Algunas secciones de IA no pasaron la validación y se reemplazaron con titulares de las fuentes.',
+      degradedText: 'Algunas secciones de IA no pasaron la validación o los controles de calidad y se reemplazaron con titulares de las fuentes.',
       historyBanner: 'Estás viendo una edición anterior:',
       goLatest: 'Ir a la edición vigente',
       newEdition: 'Hay una edición más reciente.',
@@ -76,13 +77,16 @@
       headlines: 'Titulares recientes',
       noHeadlines: 'Sin titulares en esta ventana.',
       indicators: 'Indicadores clave',
-      summary: 'Resumen'
+      summary: 'Resumen',
+      release: 'versión'
     }
   };
 
   var CLASS_OK = /^(green|red|flat)$/;
   var BADGE_OK = /^ncat-[a-z]$/;
   var ID_OK = /^[a-z0-9-]{1,40}$/;
+  var NOTE_KIND_OK = /^(ai|headline|none)$/;
+  var RELEASE_OK = /^[A-Za-z0-9._-]{1,40}$/;
   var FILE_OK = /^editions\/[A-Za-z0-9._-]+\.json$/;
 
   function ui(lang) {
@@ -218,14 +222,65 @@
     return (
       '<article class="top-day-card ' + slotCls + '"><div class="td-kicker">' + esc(c.kicker) + '</div>' +
       (c.badge ? '<div class="td-badge">' + badge(c.badge) + '</div>' : '') +
-      '<h3 class="td-title">' + esc(c.title) + '</h3>' + tk +
+      '<h3 class="td-title">' + esc(c.title) + '</h3>' + tk + chipRow(c.chips) +
       (c.paragraph ? '<p class="td-parrafo">' + esc(c.paragraph) + '</p>' : '') +
       fields(c.fields) + sourcesLine(c.sources, t, true) + '</article>'
     );
   }
 
+  function chipRow(list) {
+    if (!list || !list.length) return '';
+    return (
+      '<div class="td-chips">' +
+      list
+        .map(function (c) {
+          return '<span class="td-chip"><span class="tick">' + esc(c.symbol) + '</span><span class="td-chip-ch ' + cls(c.cls) + '">' +
+            esc(c.change) + '</span></span>';
+        })
+        .join('') +
+      '</div>'
+    );
+  }
+
+  function boardRow(r) {
+    var kind = NOTE_KIND_OK.test(r.noteKind || '') ? r.noteKind : 'none';
+    var sent = r.sentiment ? '<span class="sent sent-' + safeId(r.sentiment.key) + '">' + esc(r.sentiment.label) + '</span>' : '';
+    var earn = r.earnings ? '<span class="earn">' + esc(r.earnings) + '</span>' : '';
+    var src = r.source && r.source.name
+      ? '<span class="bd-src">' + extLink(r.source.url, r.source.name, 'src-link') +
+        (r.source.time ? '<span class="src-time"> · ' + esc(r.source.time) + '</span>' : '') + '</span>'
+      : '';
+    var label = r.noteLabel ? '<span class="bd-note-lbl">' + esc(r.noteLabel) + ':</span> ' : '';
+    return (
+      '<tr class="bd-row" role="row"><td class="bd-rank" role="cell">' + esc(r.rank) + '</td>' +
+      '<th class="bd-co" scope="row" role="rowheader"><span class="tick">' + esc(r.symbol) + '</span><span class="bd-name">' + esc(r.name) + '</span></th>' +
+      '<td class="bd-px" role="cell">' + esc(r.price) + '</td>' +
+      '<td class="bd-ch ' + cls(r.cls) + '" role="cell">' + esc(r.change) + '</td>' +
+      '<td class="bd-cap" role="cell">' + esc(r.marketCap) + '</td>' +
+      '<td class="bd-note bd-' + kind + '" role="cell"><div class="bd-text">' + label + esc(r.note) + '</div>' +
+      (sent || earn || src ? '<div class="bd-meta">' + sent + earn + src + '</div>' : '') + '</td></tr>'
+    );
+  }
+
+  function renderBoard(b) {
+    if (!b || !b.rows || !b.rows.length) return '';
+    var c = b.columns || {};
+    return (
+      '<section class="board" aria-label="' + esc(b.title) + '"><div class="board-head"><h3 class="board-title">' + esc(b.title) + '</h3>' +
+      (b.note ? '<p class="board-note">' + esc(b.note) + '</p>' : '') + '</div>' +
+      '<table class="board-table" role="table"><thead><tr role="row">' +
+      '<th scope="col" role="columnheader" class="bd-rank">' + esc(c.rank) + '</th>' +
+      '<th scope="col" role="columnheader" class="bd-co">' + esc(c.company) + '</th>' +
+      '<th scope="col" role="columnheader" class="bd-px">' + esc(c.price) + '</th>' +
+      '<th scope="col" role="columnheader" class="bd-ch">' + esc(c.change) + '</th>' +
+      '<th scope="col" role="columnheader" class="bd-cap">' + esc(c.cap) + '</th>' +
+      '<th scope="col" role="columnheader" class="bd-note">' + esc(c.note) + '</th></tr></thead><tbody>' +
+      b.rows.map(boardRow).join('') + '</tbody></table></section>'
+    );
+  }
+
   function renderTop(p, t) {
-    return '<div class="top-day">' + (p.cards || []).map(function (c) { return topCard(c, t); }).join('') + '</div>';
+    return '<div class="top-day">' + (p.cards || []).map(function (c) { return topCard(c, t); }).join('') + '</div>' + renderBoard(p.board);
   }
 
   function storyCard(s, t, open) {
@@ -414,12 +469,13 @@
     var gen = ed.generatedAt ? new Date(ed.generatedAt) : null;
     var genText = gen && !isNaN(gen.getTime()) ? gen.toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : '';
     var model = qa.modelLabel && qa.modelLabel !== 'demo' ? ' · ' + esc(qa.modelLabel) + ' · Amazon Bedrock' : '';
+    var release = RELEASE_OK.test(qa.release || '') && qa.release !== 'local' ? ' · ' + esc(t.release) + ' ' + esc(qa.release.slice(0, 12)) : '';
     return (
       '<footer class="site-footer">' +
       (srcs ? '<p><b>' + esc(f.sourcesLabel) + ':</b> ' + srcs + '</p>' : '') +
       (f.methodology ? '<p><b>' + esc(t.methodology) + ':</b> ' + esc(f.methodology) + '</p>' : '') +
       (f.disclaimer ? '<p class="disclaimer"><b>' + esc(t.disclaimer) + ':</b> ' + esc(f.disclaimer) + '</p>' : '') +
-      '<p class="gen">' + esc(t.generated) + ' ' + esc(genText) + model + '</p></footer>'
+      '<p class="gen">' + esc(t.generated) + ' ' + esc(genText) + model + release + '</p></footer>'
     );
   }
 

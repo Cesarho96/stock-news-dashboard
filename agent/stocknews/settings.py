@@ -71,6 +71,21 @@ class Settings:
     rss_enabled: bool = True
     # Publishing
     site_bucket: str = ""
+    # LLMOps: environment, release identity, run records, online evals, release registry
+    environment: str = "local"  # local | dev | prod
+    release_id: str = "local"  # git SHA of the deployed build
+    ops_bucket: str = ""  # run records, eval datasets/reports, caches (bootstrap stack)
+    judge_enabled: bool = True
+    judge_model_id: str = "global.anthropic.claude-haiku-5-5"
+    judge_effort: str = "low"
+    quality_floor: float = 0.6  # groundedness below this -> AI text withheld (fallback edition)
+    quality_target: float = 0.8  # groundedness below this -> edition flagged as degraded
+    bake_editions: int = 3  # good editions needed before a release becomes "last good"
+    registry_prefix: str = ""  # SSM path, e.g. /stock-news-dashboard/prod
+    judge_price_input_mtok: float = 1.0
+    judge_price_output_mtok: float = 5.0
+    cache_dir: str = ""  # local runs: company-profile cache folder (S3 ops bucket in AWS)
+    records_dir: str = ""  # local runs: run-record folder (S3 ops bucket in AWS)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -96,6 +111,21 @@ class Settings:
         s.sec_user_agent = env.get("SEC_USER_AGENT", "").strip()
         s.rss_enabled = _flag(env.get("RSS_ENABLED"), s.rss_enabled)
         s.site_bucket = env.get("SITE_BUCKET", "").strip()
+        s.environment = (env.get("ENVIRONMENT") or s.environment).strip().lower()
+        s.release_id = (env.get("RELEASE_ID") or s.release_id).strip()
+        s.ops_bucket = env.get("OPS_BUCKET", "").strip()
+        s.judge_enabled = _flag(env.get("JUDGE_ENABLED"), s.judge_enabled)
+        s.judge_model_id = env.get("JUDGE_MODEL_ID") or s.judge_model_id
+        judge_effort = (env.get("JUDGE_EFFORT") or s.judge_effort).strip().lower()
+        s.judge_effort = "" if judge_effort in ("", "none", "off", "default") else judge_effort
+        s.quality_floor = _float(env.get("QUALITY_FLOOR"), s.quality_floor)
+        s.quality_target = _float(env.get("QUALITY_TARGET"), s.quality_target)
+        s.bake_editions = _int(env.get("BAKE_EDITIONS"), s.bake_editions)
+        s.registry_prefix = env.get("REGISTRY_PREFIX", "").strip().rstrip("/")
+        s.judge_price_input_mtok = _float(env.get("JUDGE_PRICE_INPUT_MTOK"), s.judge_price_input_mtok)
+        s.judge_price_output_mtok = _float(env.get("JUDGE_PRICE_OUTPUT_MTOK"), s.judge_price_output_mtok)
+        s.cache_dir = env.get("CACHE_DIR", "").strip()
+        s.records_dir = env.get("RECORDS_DIR", "").strip()
         return s
 
 
@@ -111,21 +141,41 @@ def load_config(settings: Settings | None = None, path: Path | None = None) -> d
         ]
     for w in cfg.get("watchlist", []):
         w["symbol"] = w["symbol"].upper()
+    universe = cfg.setdefault("universe", {})
+    universe.setdefault("size", 20)
+    universe.setdefault("index", "S&P 500")
+    for item in universe.setdefault("pool", []):
+        item["symbol"] = item["symbol"].upper()
     return cfg
+
+
+def company_info(cfg: dict) -> dict[str, dict]:
+    """Every company the config knows (universe pool first, then the watchlist), by symbol."""
+    info: dict[str, dict] = {}
+    for item in (cfg.get("universe") or {}).get("pool", []) + cfg.get("watchlist", []):
+        merged = dict(info.get(item["symbol"], {}))
+        for key, value in item.items():
+            if key == "aliases":
+                merged["aliases"] = list(dict.fromkeys((merged.get("aliases") or []) + list(value or [])))
+            elif value not in (None, "") or key not in merged:
+                merged[key] = value
+        info[item["symbol"]] = merged
+    return info
 
 
 def limits(cfg: dict) -> dict:
     defaults = {
-        "companyNewsInWindow": 6,
-        "companyNewsContext": 2,
+        "companyNewsInWindow": 5,
+        "companyNewsContext": 1,
         "marketNews": 25,
         "rssPerFeed": 8,
-        "filingsPerTicker": 3,
-        "maxEvidence": 200,
-        "summaryChars": 280,
+        "filingsPerTicker": 2,
+        "maxEvidence": 260,
+        "summaryChars": 260,
         "contextDays": 7,
         "earningsDaysAhead": 14,
         "manifestEditions": 120,
+        "profileMaxAgeHours": 20,
     }
     defaults.update(cfg.get("limits") or {})
     return defaults

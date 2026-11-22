@@ -136,11 +136,20 @@ def test_labels_spanish():
 
 
 # ---- collection --------------------------------------------------------------------------
-def test_collect_all(ctx, cfg, settings, fake_fh):
+def test_collect_all(ctx, cfg, settings, fake_fh, tmp_path):
+    from stocknews.storage import JsonDoc
+
     http = FakeHttp({"cnbc": (FIXTURES / "rss_sample.xml").read_bytes()})
-    snapshot, pool, stats = collect_all(ctx, cfg, settings, fake_fh, None, http)
+    cache = JsonDoc(str(tmp_path / "profiles.json"))
+    snapshot, pool, stats = collect_all(ctx, cfg, settings, fake_fh, None, http, profile_cache=cache)
     assert "SPY" in snapshot.quotes and "XLK" in snapshot.quotes and "NVDA" in snapshot.quotes
-    assert [r["symbol"] for r in snapshot.earnings] == ["NVDA"]  # non-watchlist rows dropped
+    # top 20 by market cap from the configured pool; NFLX (watchlist) ranks 22nd
+    assert len(snapshot.universe) == 20 and snapshot.top20[:4] == ["NVDA", "AAPL", "MSFT", "GOOGL"]
+    assert [r["rank"] for r in snapshot.universe] == list(range(1, 21)) and "NFLX" not in snapshot.top20
+    assert snapshot.universe[0]["marketCap"] == 4_450_000 * 1e6
+    news_calls = [c[1] for c in fake_fh.calls if c[0] == "company_news"]
+    assert news_calls == snapshot.top20 + ["NFLX"]  # top 20 + watchlist extras only
+    assert [r["symbol"] for r in snapshot.earnings] == ["NVDA"]  # rows for uncovered tickers dropped
     titles = [e.title for e in pool.items.values()]
     assert "Old story outside the window about markets" not in titles  # market news: window only
     assert any("Microsoft & OpenAI" in t for t in titles)  # RSS item kept and tagged
@@ -148,3 +157,26 @@ def test_collect_all(ctx, cfg, settings, fake_fh):
     assert msft_rss.tickers == ["MSFT"] and msft_rss.source == "CNBC"
     assert any("rss marketwatch-top" in e for e in stats["errors"])  # unreachable feed noted, not fatal
     assert pool.by_ticker("AAPL")[0].origin == "company:AAPL"
+    # profiles are cached: a second run within the max age does not call the profile endpoint again
+    assert cache.load()["profiles"]["NVDA"]["marketCapitalization"] == 4_450_000
+    fake_fh.calls.clear()
+    collect_all(ctx, cfg, settings, fake_fh, None, http, profile_cache=cache)
+    assert not [c for c in fake_fh.calls if c[0] == "profile"]
+
+
+def test_rank_universe_orders_by_market_cap():
+    from stocknews.market import rank_universe
+
+    pool = [{"symbol": "AAA", "name": "A"}, {"symbol": "BBB", "name": "B"}, {"symbol": "CCC", "name": "C"},
+            {"symbol": "DDD", "name": "D"}]
+    quotes = {s: {"price": 1.0} for s in ("AAA", "BBB", "CCC")}  # DDD has no quote: skipped
+    profiles = {"AAA": {"marketCapitalization": 100}, "BBB": {"marketCapitalization": 300}, "CCC": {}}
+    ranked = rank_universe(pool, quotes, profiles, size=3)
+    assert [(r["rank"], r["symbol"], r["marketCap"]) for r in ranked] == [(1, "BBB", 3e8), (2, "AAA", 1e8),
+                                                                          (3, "CCC", None)]
+
+
+def test_fmt_cap():
+    from stocknews.market import fmt_cap
+
+    assert fmt_cap(4.94e12) == "$4.94T" and fmt_cap(9.83e11) == "$983B" and fmt_cap(None) == "—"
