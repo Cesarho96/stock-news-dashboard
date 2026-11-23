@@ -79,8 +79,11 @@ def cmd_validate(args) -> None:
     import shutil
 
     os.environ.setdefault("AWS_DEFAULT_REGION", args.region or "us-east-1")
-    from samtranslator.translator.transform import transform
-    from samtranslator.yaml_helper import yaml_parse
+    try:
+        from samtranslator.translator.transform import transform
+        from samtranslator.yaml_helper import yaml_parse
+    except ModuleNotFoundError:
+        raise SystemExit("aws-sam-translator is not installed: pip install -r requirements-dev.txt") from None
 
     if shutil.which("cfn-lint"):
         run([tool("cfn-lint"), str(ROOT / "template.yaml"), str(ROOT / "infra" / "bootstrap.yaml")])
