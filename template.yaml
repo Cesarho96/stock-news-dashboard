@@ -31,7 +31,7 @@ Parameters:
     Type: String
     Default: global.anthropic.claude-sonnet-5-5
     AllowedPattern: "^[a-z]+\\.[a-z0-9-]+\\.[A-Za-z0-9.:-]+$"
-    Description: Bedrock inference profile of the writer model, e.g. global.anthropic.claude-sonnet-5-5.
+    Description: Bedrock inference profile of the writer model (set through a model profile in infra/models.json).
   Effort:
     Type: String
     Default: medium
@@ -46,6 +46,37 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  Thinking:
+    Type: String
+    Default: adaptive
+    AllowedValues: [adaptive, "off"]
+    Description: Writer thinking mode. Use "off" for models without adaptive thinking (Claude Haiku 4.5).
+  JudgeEffort:
+    Type: String
+    Default: low
+    AllowedValues: [low, medium, high, none]
+    Description: Effort level of the judge model ("none" for models without the effort parameter).
+  JudgeThinking:
+    Type: String
+    Default: adaptive
+    AllowedValues: [adaptive, "off"]
+  PriceInputMtok:
+    Type: String
+    Default: "2"
+    AllowedPattern: "^[0-9]+(\\.[0-9]+)?$"
+    Description: Writer price per million input tokens in USD (cost metric and alarm).
+  PriceOutputMtok:
+    Type: String
+    Default: "10"
+    AllowedPattern: "^[0-9]+(\\.[0-9]+)?$"
+  JudgePriceInputMtok:
+    Type: String
+    Default: "1"
+    AllowedPattern: "^[0-9]+(\\.[0-9]+)?$"
+  JudgePriceOutputMtok:
+    Type: String
+    Default: "5"
+    AllowedPattern: "^[0-9]+(\\.[0-9]+)?$"
   QualityFloor:
     Type: String
     Default: "0.6"
@@ -285,6 +316,13 @@ Resources:
           OPS_BUCKET: !Ref OpsBucketName
           JUDGE_ENABLED: !Ref JudgeEnabled
           JUDGE_MODEL_ID: !Ref JudgeModelId
+          THINKING: !Ref Thinking
+          JUDGE_EFFORT: !Ref JudgeEffort
+          JUDGE_THINKING: !Ref JudgeThinking
+          PRICE_INPUT_MTOK: !Ref PriceInputMtok
+          PRICE_OUTPUT_MTOK: !Ref PriceOutputMtok
+          JUDGE_PRICE_INPUT_MTOK: !Ref JudgePriceInputMtok
+          JUDGE_PRICE_OUTPUT_MTOK: !Ref JudgePriceOutputMtok
           QUALITY_FLOOR: !Ref QualityFloor
           QUALITY_TARGET: !Ref QualityTarget
           BAKE_EDITIONS: !Ref BakeEditions

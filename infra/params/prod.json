@@ -1,8 +1,7 @@
 {
   "_comment": "Parameters for the prod stack (stock-news-dashboard-prod). Changing a model id or the language here is a release like any other: it goes through the eval gate, the smoke test and the bake.",
-  "ModelId": "global.anthropic.claude-sonnet-5-5",
-  "Effort": "medium",
-  "JudgeModelId": "global.anthropic.claude-haiku-5-5",
+  "ModelProfile": "haiku-4-5",
+  "_modelProfileComment": "Models come from infra/models.json. 'haiku-4-5' is the interim profile while the account only has Claude Haiku 4.5; switch to 'target' (Claude Sonnet 5.5 writer, Claude Haiku 5.5 judge) once check-models passes for it.",
   "JudgeEnabled": "true",
   "QualityFloor": "0.6",
   "QualityTarget": "0.8",
