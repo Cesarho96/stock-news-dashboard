@@ -249,3 +249,70 @@ def test_check_models_reports_whether_the_edition_schema_compiles():
     denied = deploy.check_edition_schema(BedrockClaude("m", "us-east-1", "", "off", 64, client=ScriptedBedrock([
         FakeClientError("ThrottlingException", "Too many tokens")])))
     assert not denied["ok"] and "Service Quotas" in denied["advice"]
+
+
+# ---- GitHub Actions setup (scripts/deploy.py github-setup) ---------------------------------------
+BOOT = {"DeployRoleArn": "arn:aws:iam::1:role/deploy", "EvalsRoleArn": "arn:aws:iam::1:role/evals",
+        "OpsBucketName": "ops-bucket", "ArtifactsBucketName": "artifacts", "CloudFormationExecRoleArn": "x"}
+
+
+def test_github_variables_and_secrets_match_the_workflows():
+    values = deploy.github_variables(BOOT, "us-east-1")
+    assert values == {"AWS_ROLE_ARN": "arn:aws:iam::1:role/deploy", "AWS_EVALS_ROLE_ARN": "arn:aws:iam::1:role/evals",
+                      "OPS_BUCKET": "ops-bucket", "AWS_REGION": "us-east-1"}
+    secrets = deploy.github_secrets("me@example.com", "Me me@example.com")
+    assert secrets == {"ALARM_EMAIL": "me@example.com", "SEC_USER_AGENT": "Me me@example.com"}
+    assert deploy.github_secrets("", "") == {}
+    workflows = "".join(p.read_text(encoding="utf-8") for p in (ROOT / ".github" / "workflows").glob("*.yml"))
+    for name in values:  # every variable and secret is one the workflows read
+        assert f"vars.{name}" in workflows
+    for name in secrets:  # email addresses only through secrets: masked in the public logs
+        assert f"secrets.{name}" in workflows
+    assert f"name: {deploy.CI_CHECK}" in (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
+def test_github_setup_applies_variables_environments_and_protection(monkeypatch):
+    import argparse
+    import subprocess
+
+    calls = []
+
+    def fake_gh(args, body=None):
+        calls.append((args, body))
+        out = "12345\n" if args[:2] == ["api", "user"] else ""
+        if any("deployment-branch-policies" in a for a in args):  # a re-run: the policy is already there
+            return subprocess.CompletedProcess(args, 1, "", "gh: Name already exists (HTTP 422)")
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(deploy, "gh", fake_gh)
+    monkeypatch.setattr(deploy.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(deploy, "session", lambda region, profile: FakeSession(FakeCF()))
+    monkeypatch.setattr(deploy, "_bootstrap", lambda sess: BOOT)
+    monkeypatch.setattr(deploy, "previous_parameters", lambda sess, stack: {"GitHubRepository": "o/r"})
+    deploy.cmd_github_setup(argparse.Namespace(region=None, profile="personal", repo=None, alarm_email="me@x.com",
+                                               sec_user_agent=None, dry_run=False))
+    variables = [a for a, _ in calls if a[:2] == ["variable", "set"]]
+    assert [a[2] for a in variables] == ["AWS_ROLE_ARN", "AWS_EVALS_ROLE_ARN", "OPS_BUCKET", "AWS_REGION"]
+    assert all(a[3:5] == ["--repo", "o/r"] for a in variables)
+    assert [a[2:] for a, _ in calls if a[:2] == ["secret", "set"]] == [["ALARM_EMAIL", "--repo", "o/r", "--body",
+                                                                         "me@x.com"]]
+    bodies = {a[3]: b for a, b in calls if a[:3] == ["api", "--method", "PUT"]}
+    assert bodies["repos/o/r/environments/production"]["reviewers"] == [{"type": "User", "id": 12345}]
+    assert "reviewers" not in bodies["repos/o/r/environments/dev"]
+    assert bodies["repos/o/r/environments/dev"]["deployment_branch_policy"]["custom_branch_policies"] is True
+    checks = bodies["repos/o/r/branches/main/protection"]["required_status_checks"]["checks"]
+    assert checks == [{"context": "lint, tests, templates"}]
+
+
+def test_github_setup_without_the_cli_prints_the_values(monkeypatch, capsys):
+    import argparse
+
+    monkeypatch.setattr(deploy.shutil, "which", lambda name: None)
+    monkeypatch.setattr(deploy, "session", lambda region, profile: FakeSession(FakeCF()))
+    monkeypatch.setattr(deploy, "_bootstrap", lambda sess: BOOT)
+    deploy.cmd_github_setup(argparse.Namespace(region=None, profile=None, repo="o/r", alarm_email="", sec_user_agent="",
+                                               dry_run=False))
+    out = capsys.readouterr().out
+    assert "winget install --id GitHub.cli" in out and "https://github.com/o/r/settings/variables/actions" in out
+    assert "AWS_ROLE_ARN" in out and "arn:aws:iam::1:role/deploy" in out and "Required reviewers" in out
+    assert "settings/secrets/actions" in out and "ALARM_EMAIL" in out

@@ -164,13 +164,25 @@ If a deployment fails, the script prints the stack status and the reason CloudFo
 | `release` | push to `main` | test → package → eval gate → dev → production (approval) |
 | `operate` | manual | status, rollback, AI kill switch, withdraw an edition, run an edition |
 
-Setup (once): run the bootstrap (section 2), then in the repository settings:
+Until the setup below is done, the AWS jobs show as **skipped**: `evals` on pull requests and everything after `test` in `release`. They are gated on the repository variables.
 
-1. **Variables:** `AWS_ROLE_ARN` (bootstrap output `DeployRoleArn`), `AWS_EVALS_ROLE_ARN` (`EvalsRoleArn`), `OPS_BUCKET` (`OpsBucketName`), and optionally `AWS_REGION`, `ALARM_EMAIL`, `SEC_USER_AGENT`, `RUNNER_LABEL` (e.g. `self-hosted`), `EVALS_MAX_CASES`.
-2. **Environments:** create `dev` and `production`; on `production` add yourself as a required reviewer (and optionally restrict it to the `main` branch).
-3. **Branch protection on `main`:** require the `ci` check (and `evals` if you want the eval gate on every PR).
+Setup (once), after the bootstrap (section 2), with the [GitHub CLI](https://cli.github.com/) signed in (`winget install --id GitHub.cli`, then `gh auth login`):
 
-Work on a branch, open a PR (ci + evals run), merge, approve the production deployment.
+```powershell
+$env:ALARM_EMAIL = "you@example.com"; $env:SEC_USER_AGENT = "Your Name you@example.com"
+python scripts/deploy.py --profile NAME github-setup
+```
+
+It reads the bootstrap outputs and configures the repository the bootstrap roles trust:
+
+1. **Variables:** `AWS_ROLE_ARN` (bootstrap output `DeployRoleArn`), `AWS_EVALS_ROLE_ARN` (`EvalsRoleArn`), `OPS_BUCKET` (`OpsBucketName`), `AWS_REGION`. Optional, by hand: `RUNNER_LABEL` (e.g. `self-hosted`), `EVALS_MAX_CASES`.
+   **Secrets:** `ALARM_EMAIL` and `SEC_USER_AGENT`, when set. They hold an email address, and GitHub masks secrets in the workflow logs, which anyone can read on a public repository.
+2. **Environments:** `dev` and `production`, both deployable only from `main`; `production` waits for your approval.
+3. **Branch protection on `main`:** requires the `lint, tests, templates` check.
+
+Without the GitHub CLI (or with `--dry-run`) it prints the values and where to set them by hand. Start the first run with `gh workflow run release --ref main` (or Actions > release > Run workflow).
+
+Work on a branch, open a PR (ci + evals run), merge, approve the production deployment. Once CI deploys, stop running `release` from your machine: two deployments of the same stack at once collide.
 
 ## 4. Run the real pipeline and the evals on your machine
 
