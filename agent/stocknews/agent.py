@@ -120,11 +120,11 @@ class NewsAgent:
                 research_note = "(research stopped: too many tool rounds)"
             log.info("research done: %d tool calls; note: %s", self.tools.calls,
                      research_note[:500].replace("\n", " "))
-            messages.append({"role": "user", "content": [{"type": "text", "text": prompts.write_instruction(
-                None if self.llm.structured_output else schema)}]})
+            messages.append({"role": "user", "content": [{"type": "text", "text": prompts.write_instruction()}]})
         else:
-            messages = [{"role": "user", "content": [briefing, {"type": "text", "text": prompts.write_instruction(
-                None if self.llm.structured_output else schema)}]}]
+            messages = [{"role": "user", "content": [briefing, {"type": "text", "text": prompts.write_instruction()}]}]
+        # Without structured output (not offered, or the schema is too complex to compile) the Bedrock
+        # client appends the schema to the last user turn, and validation + repair rounds enforce it.
 
         # ---- phase 2: write + validate + repair ---------------------------------------
         vctx = ValidationContext(
@@ -170,8 +170,7 @@ class NewsAgent:
                 notes.append("Skipped repair rounds: not enough time left in this run")
                 break
             repairs += 1
-            repair = prompts.repair_message(problems, truncated,
-                                            schema=None if self.llm.structured_output else schema)
+            repair = prompts.repair_message(problems, truncated)
             messages.append({"role": "user", "content": [{"type": "text", "text": repair}]})
 
         if analysis is None:

@@ -118,12 +118,14 @@ def test_judge_falls_back_to_prompt_schema(seed):
     fake = ScriptedBedrock([
         FakeClientError("ValidationException", "output_config.format: json_schema is not supported"),
         FakeClientError("ValidationException", "output_config.format: json_schema is not supported"),
-        text_response("I think they are mostly fine."),  # prose: retry with the schema in the prompt
+        text_response("I think they are mostly fine."),  # prose despite the schema in the prompt: ask again
         judge_step(),
     ])
     result = judge_edition(BedrockClaude("m", "us-east-1", "low", client=fake), a, snapshot, pool, cfg_case, ctx)
     assert result.error is None and result.groundedness == 1.0
-    assert "matching this JSON schema" in fake.requests[-1]["messages"][0]["content"][0]["text"]
+    for request in fake.requests[2:]:  # both calls without structured output describe the schema
+        assert "output_config" not in request
+        assert "must match this JSON schema" in request["messages"][0]["content"][-1]["text"]
 
 
 # ---- eval suite ------------------------------------------------------------------------------
@@ -394,6 +396,23 @@ def test_smoke_mode(monkeypatch):
     monkeypatch.setenv("RELEASE_ID", "abc")
     out = handler.lambda_handler({"mode": "smoke"}, None)
     assert out["ok"] and out["release"] == "abc" and seen == {"specs": ["seed:"], "gate": "smoke", "language": "en"}
+
+
+def test_smoke_gate_passes_when_bedrock_cannot_compile_the_schemas(settings, cfg):
+    """What the deployment smoke test sees on a model that rejects the schemas as too complex."""
+    settings.judge_enabled = True
+    cfg_case, _, snapshot, pool, _ = materialize(seed_case(cfg), cfg)
+    grammar = FakeClientError("ValidationException", "The compiled grammar is too large, which would cause "
+                                                     "performance issues. Simplify your tool schemas.")
+    writer_fake = ScriptedBedrock([text_response("- research note"), grammar, grammar,
+                                   text_response(valid_analysis(snapshot, pool, cfg_case))])
+    judge_fake = ScriptedBedrock([grammar, judge_step()])
+    report = runner.run_suite(["seed:"], settings, cfg, gate="smoke",
+                              llm_factory=lambda: BedrockClaude("m", "us-east-1", "", "off", client=writer_fake),
+                              judge_factory=lambda: BedrockClaude("j", "us-east-1", "", "off", client=judge_fake))
+    assert report["gate"]["ok"], report["gate"]["failures"]
+    assert report["cases"][0]["status"] == "ok" and report["aggregate"]["groundedness_mean"] == 1.0
+    assert "output_config" not in writer_fake.requests[-1] and "output_config" not in judge_fake.requests[-1]
 
 
 def test_gate_skips_judge_checks_when_the_judge_is_off(settings, cfg):

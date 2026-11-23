@@ -14,7 +14,7 @@ from .clock import EditionContext
 from .evidence import EvidencePool
 from .market import MarketSnapshot, coverage, fmt_cap, market_table
 
-PROMPT_VERSION = "2026-11-22.top20"
+PROMPT_VERSION = "2026-11-23.top20"
 LANGUAGE_NAMES = {"en": "English", "es": "Spanish (Mexico), neutral business register"}
 
 
@@ -101,8 +101,8 @@ If a big top-20 move or a company named in the market news needs more facts, cal
 When you are done, reply with a short research note: up to 8 bullet points naming the stories you plan to feature and their evidence IDs. Do not write the edition JSON yet."""
 
 
-def write_instruction(schema: dict | None = None) -> str:
-    text = """STEP 2 (write). Now write the complete edition as JSON that follows the response schema.
+def write_instruction() -> str:
+    return """STEP 2 (write). Now write the complete edition as JSON that follows the response schema.
 Checklist:
 - top: all three cards are about TOP 20 companies only. top.whatHappened: how the top 20 traded and why, in one paragraph. top.keyAlert: the most important risk, alert or catalyst for a top-20 company. top.marketMover: the top-20 stock whose move matters most, and why.
 - top20: exactly one note per TOP 20 company, in rank order. If a company had no company-specific news, say so plainly and use an empty evidence list.
@@ -111,21 +111,14 @@ Checklist:
 - sectors: only stories the evidence supports; it is fine to leave a sector without a story.
 - radar: 3-6 forward-looking items (earnings dates, data releases, events), with evidence when available.
 - Cite only existing evidence IDs; no story may repeat another."""
-    if schema is not None:
-        text += ("\nReturn ONLY the JSON object, with no prose and no code fences. It must match this JSON schema:\n"
-                 + json.dumps(schema, separators=(",", ":")))
-    return text
 
 
-def repair_message(problems: list[str], truncated: bool = False, schema: dict | None = None) -> str:
+def repair_message(problems: list[str], truncated: bool = False) -> str:
     lines = ["Your edition JSON did not pass validation. Fix exactly these problems and return the full corrected JSON:"]
     lines += [f"- {p}" for p in problems[:25]]
     if truncated:
         lines.append("- Your previous answer was cut off. Be more concise: shorter sentences, at most 8 latest stories, at most 1 story per sector.")
     lines.append("Keep everything else that was valid.")
-    if schema is not None:
-        lines.append("Return ONLY the JSON object (no prose, no code fences) matching this JSON schema:\n"
-                     + json.dumps(schema, separators=(",", ":")))
     return "\n".join(lines)
 
 

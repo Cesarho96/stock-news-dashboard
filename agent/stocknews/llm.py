@@ -2,8 +2,11 @@
 
 InvokeModel takes an opaque JSON body, so the Lambda only needs the boto3 that ships
 with the runtime. If a model/region rejects an optional feature (effort, structured
-output, strict tools, adaptive thinking) the client drops that feature and retries,
-and the agent falls back to prompt-described JSON.
+output, strict tools, adaptive thinking) the client drops that feature and retries.
+That includes schemas too complex for constrained decoding ("The compiled grammar is
+too large"): strict tools go first, then the JSON output schema. Without structured
+output, the client describes the schema in the last user turn of every request that
+has one, so callers never need to know which mode was used.
 """
 
 from __future__ import annotations
@@ -17,6 +20,26 @@ log = logging.getLogger(__name__)
 
 class LLMError(Exception):
     pass
+
+
+SCHEMA_IN_PROMPT = "Return ONLY the JSON object, with no prose and no code fences. It must match this JSON schema:\n"
+# Bedrock/Anthropic could not compile the schemas for constrained decoding (size or complexity).
+TOO_COMPLEX = ("grammar", "too complex")
+
+
+def with_schema_text(messages: list, schema: dict) -> list:
+    """Copy of `messages` whose last user turn ends with the schema (structured output is off)."""
+    block = {"type": "text", "text": SCHEMA_IN_PROMPT + json.dumps(schema, separators=(",", ":"))}
+    out = list(messages)
+    if out and out[-1].get("role") == "user":
+        last = dict(out[-1])
+        content = last.get("content")
+        blocks = list(content) if isinstance(content, list) else [{"type": "text", "text": str(content or "")}]
+        last["content"] = blocks + [block]
+        out[-1] = last
+    else:
+        out.append({"role": "user", "content": [block]})
+    return out
 
 
 def _make_client(region: str):
@@ -66,6 +89,8 @@ class BedrockClaude:
         return self.features["format"]
 
     def _body(self, system: str, messages: list, tools, tool_choice, output_schema) -> dict:
+        if output_schema is not None and not self.features["format"]:
+            messages = with_schema_text(messages, output_schema)
         body: dict[str, Any] = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": self.max_tokens,
@@ -86,9 +111,13 @@ class BedrockClaude:
             body["thinking"] = {"type": "adaptive"}
         return body
 
-    def _downgrade(self, message: str) -> bool:
+    def _downgrade(self, message: str, *, tools: bool = False, schema: bool = False) -> bool:
         msg = message.lower()
         order = []
+        if any(k in msg for k in TOO_COMPLEX):
+            # The schemas did not compile for constrained decoding. Strict tools add to the grammar, so
+            # they go first; then the JSON output schema (described in the prompt from then on).
+            order += (["strict"] if tools else []) + (["format"] if schema else [])
         if "effort" in msg:
             order.append("effort")
         if "strict" in msg:
@@ -118,7 +147,8 @@ class BedrockClaude:
                 )
             except Exception as exc:  # botocore ClientError and friends
                 info = _error_info(exc)
-                if info and info[0] == "ValidationException" and self._downgrade(info[1]):
+                if info and info[0] == "ValidationException" and self._downgrade(
+                        info[1], tools=bool(tools), schema=output_schema is not None):
                     continue
                 if info:
                     raise LLMError(f"Bedrock {info[0]}: {info[1]}") from exc

@@ -152,9 +152,9 @@ def judge_edition(llm: BedrockClaude, analysis: dict, snapshot: MarketSnapshot, 
         result.error = "nothing to judge"
         return result
     try:
-        text_in = prompt
         for attempt in range(2):
-            resp = llm.create(system=JUDGE_SYSTEM, messages=[{"role": "user", "content": [{"type": "text", "text": text_in}]}],
+            # without structured output the client appends JUDGE_SCHEMA to the prompt
+            resp = llm.create(system=JUDGE_SYSTEM, messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                               output_schema=JUDGE_SCHEMA)
             if resp.get("stop_reason") == "refusal":
                 raise LLMError("the judge model declined")
@@ -165,9 +165,7 @@ def judge_edition(llm: BedrockClaude, analysis: dict, snapshot: MarketSnapshot, 
             except (json.JSONDecodeError, ValueError):
                 if attempt or llm.structured_output:
                     raise
-                # structured output was not available: describe the schema in the prompt instead
-                text_in = (prompt + "\n\nReturn ONLY a JSON object (no prose, no code fences) matching this JSON "
-                           "schema:\n" + json.dumps(JUDGE_SCHEMA, separators=(",", ":")))
+                # prose although the prompt described the schema: ask once more
         for row in data.get("verdicts") or []:
             uid = ids.get(str(row.get("unit", "")).strip().upper())
             verdict = row.get("verdict")

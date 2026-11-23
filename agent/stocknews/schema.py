@@ -2,7 +2,10 @@
 
 Written for Bedrock structured outputs: every object sets additionalProperties=false,
 every property is required, and no length/number constraints are used (unsupported).
-Length limits are enforced by the validator instead.
+No regex patterns either: constrained decoding compiles the whole schema into one grammar,
+patterns enlarge it, and Bedrock rejects grammars that are too large. The validator and the
+tool executor check ticker and evidence-ID formats and length limits instead. If a model
+still cannot compile the schema, the Bedrock client describes it in the prompt (llm.py).
 
 Schema version 2: "Top of the day" covers only the S&P 500 top 20 (three cards plus one
 note per top-20 company); the watchlist block only exists for tickers outside the top 20.
@@ -15,8 +18,6 @@ THEMES = ["macro", "earnings", "ai-tech", "deals", "policy", "company"]
 ALERT_CATEGORIES = ["alert", "risk", "opportunity", "macro", "earnings", "data"]
 SENTIMENTS = ["bullish", "bearish", "neutral", "mixed"]
 SIGNAL_KINDS = ["catalyst", "risk", "opportunity", "data"]
-TICKER_PATTERN = "^[A-Z][A-Z0-9.\\-]{0,9}$"
-EVIDENCE_PATTERN = "^E[0-9]{3,4}$"
 
 
 def _obj(properties: dict, description: str | None = None) -> dict:
@@ -40,20 +41,20 @@ def analysis_schema(top20: list[str], extras: list[str], sector_ids: list[str]) 
     schema (Bedrock caches compiled schemas)."""
     top_enum = sorted(top20)
     # No ranking this run (market data unavailable): accept any ticker; the validator still checks.
-    top_ticker = {"type": "string", "enum": top_enum} if top_enum else {"type": "string", "pattern": TICKER_PATTERN}
+    top_ticker = {"type": "string", "enum": top_enum} if top_enum else {"type": "string"}
     evidence = {
         "type": "array",
-        "items": {"type": "string", "pattern": EVIDENCE_PATTERN},
-        "description": "IDs of the evidence items that support this entry, most important first.",
+        "items": {"type": "string"},
+        "description": "IDs of the evidence items (E001, E002, ...) that support this entry, most important first.",
     }
     tickers = {
         "type": "array",
-        "items": {"type": "string", "pattern": TICKER_PATTERN},
-        "description": "Tickers this entry is about (may be empty).",
+        "items": {"type": "string"},
+        "description": "Tickers this entry is about, uppercase (may be empty).",
     }
     top_tickers = {
         "type": "array",
-        "items": {"type": "string", "pattern": TICKER_PATTERN},
+        "items": {"type": "string"},
         "description": "TOP 20 tickers this entry is about (at least one).",
     }
     title = _str("Headline, at most about 110 characters, no trailing period.")
@@ -148,7 +149,7 @@ def tool_definitions() -> list[dict]:
                 "the evidence list with new IDs you can cite."
             ),
             "input_schema": _obj({
-                "symbol": {"type": "string", "pattern": TICKER_PATTERN, "description": "Ticker, e.g. SMCI."},
+                "symbol": {"type": "string", "description": "Ticker, e.g. SMCI."},
                 "days": {"type": "integer", "description": "Days to look back, 1 to 7."},
             }),
         },
@@ -159,8 +160,7 @@ def tool_definitions() -> list[dict]:
                 "mentioning a price move that is not in MARKET DATA."
             ),
             "input_schema": _obj({
-                "symbols": {"type": "array", "items": {"type": "string", "pattern": TICKER_PATTERN},
-                            "description": "Tickers, at most 10."},
+                "symbols": {"type": "array", "items": {"type": "string"}, "description": "Tickers, at most 10."},
             }),
         },
     ]

@@ -55,7 +55,7 @@ Every release is a **Lambda version** (immutable: code, prompts, schema, config 
 
 - Every collected article or filing gets an ID (`E001`, …). The model sees IDs, headlines and short summaries; it never sees or writes URLs. Code fills in links, sources and timestamps, so the page cannot show a made-up link.
 - Prices, % moves and market caps come from market data. The deterministic checks flag any figure in the AI text that matches neither the quotes of the companies mentioned nor the cited evidence.
-- Bedrock **structured outputs** (JSON schema) and **strict tool use**; the top-20 tickers are schema enums, so the model cannot put a non-top-20 company in "Top of the day".
+- Bedrock **structured outputs** (JSON schema) and **strict tool use**; the top-20 tickers are schema enums, so the model cannot put a non-top-20 company in "Top of the day". If a model cannot compile the schema for constrained decoding (Bedrock answers *The compiled grammar is too large*), the client drops strict tools and then the schema, and describes the schema in the prompt instead; the validator and repair rounds enforce it either way.
 - `validate.py` fixes what is safe (unknown IDs, duplicates, over-long text) and sends the rest back for up to two repair rounds (missing top-20 notes, top cards not about the top 20, stories without fresh evidence…).
 - The **quality gate** withholds sections the judge rates unsupported, sections with unverified figures or advice language, and the whole AI text when groundedness falls under the floor. The page then shows source headlines in their place and says so.
 - If Bedrock fails, the run still publishes a clearly labeled **fallback edition** (market data + headlines). Feed text is treated as untrusted data, and the renderer escapes everything under a strict Content-Security-Policy.
@@ -96,7 +96,7 @@ The demo edition is synthetic placeholder content (headlines start with `[Demo]`
 
 Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM CLI and credentials for your account. The steps use `us-east-1`.
 
-1. **Check model access.** `python scripts/deploy.py check-models --env prod` sends one tiny request to the models of the environment's model profile and explains any problem (see [Models](#models-profiles-access-and-switching-back)). The repository currently deploys the interim `haiku-4-5` profile.
+1. **Check model access.** `python scripts/deploy.py check-models --env prod` sends one tiny request to the models of the environment's model profile and explains any problem (see [Models](#models-profiles-access-and-switching-back)). It also sends the writer's real edition schema and says whether the model compiles it for structured output or the agent will describe it in the prompt. The repository currently deploys the interim `haiku-4-5` profile.
 2. **Store your Finnhub key** (free at finnhub.io):
    ```powershell
    aws ssm put-parameter --region us-east-1 --type SecureString `

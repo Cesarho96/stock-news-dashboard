@@ -8,7 +8,7 @@
   python scripts/deploy.py release --env prod           # package (if needed) + app + site, for local use
   python scripts/deploy.py run --env dev [--slot close] # publish an edition now
   python scripts/deploy.py validate                     # cfn-lint + SAM transform + parameter checks (no AWS calls)
-  python scripts/deploy.py check-models --env prod [--model-profile target]   # Bedrock access preflight
+  python scripts/deploy.py check-models --env prod [--model-profile target]   # Bedrock access + schema preflight
 
 Needs: Python 3.10+, boto3, the AWS SAM CLI and AWS credentials (or the GitHub OIDC role in CI).
 Release id = the git commit SHA. Parameters per environment live in infra/params/<env>.json;
@@ -148,7 +148,7 @@ CHECK_TOOL = {"name": "noop", "description": "Not needed for this request; prese
 FEATURE_HINTS = {
     "effort": "the model rejected the effort parameter: set Effort / JudgeEffort to none in its model profile",
     "thinking": "the model rejected adaptive thinking: set Thinking / JudgeThinking to off in its model profile",
-    "format": "no structured outputs with this model/profile: the agent falls back to a schema in the prompt "
+    "format": "no structured outputs with this model/profile: the agent describes the schema in the prompt "
               "(more repair rounds); prefer a model or inference profile with structured outputs",
     "strict": "no strict tool use: tools still work without it",
 }
@@ -194,6 +194,47 @@ def check_model(llm) -> dict:
             "seconds": round(time.monotonic() - started, 1)}
 
 
+def edition_schema() -> dict:
+    """The writer's real output schema, for a representative top 20 and watchlist."""
+    from stocknews.schema import analysis_schema
+
+    cfg = json.loads((ROOT / "agent" / "stocknews" / "config" / "watchlist.json").read_text(encoding="utf-8"))
+    top20 = [row["symbol"] for row in cfg["universe"]["pool"]][:20]
+    extras = [w["symbol"] for w in cfg.get("watchlist", []) if w["symbol"] not in top20]
+    return analysis_schema(top20, extras, [s["id"] for s in cfg.get("sectors", [])])
+
+
+def check_edition_schema(llm) -> dict:
+    """Send the write step's schema and research tools as the agent does (a few output tokens) to see
+    whether Bedrock compiles them for constrained decoding. If not, the agent describes the schema in the
+    prompt instead: editions still get AI text, and validation and repair rounds enforce the schema."""
+    from stocknews.schema import tool_definitions
+
+    started = time.monotonic()
+    try:
+        llm.create(system="You write JSON.",
+                   messages=[{"role": "user", "content": [{"type": "text", "text": "Start the edition JSON."}]}],
+                   tools=tool_definitions(), tool_choice={"type": "none"}, output_schema=edition_schema())
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "advice": access_advice(str(exc)),
+                "seconds": round(time.monotonic() - started, 1)}
+    return {"ok": True, "structured": llm.structured_output, "strict": llm.features["strict"],
+            "seconds": round(time.monotonic() - started, 1)}
+
+
+def describe_schema_check(result: dict) -> str:
+    took = f" ({result['seconds']}s)"
+    if not result["ok"]:
+        return f"check failed{took}: {result['error']}\n        what to do: {result['advice']}"
+    if result["structured"] and result["strict"]:
+        return "compiles for structured output, with strict research tools" + took
+    if result["structured"]:
+        return ("compiles for structured output once the research tools are not strict (the agent drops strict "
+                "by itself)" + took)
+    return ("too complex for structured output on this model: the agent describes the schema in the prompt instead "
+            "(editions still get AI text; validation and repair rounds enforce the schema)" + took)
+
+
 def agreement_status(sess, model_id: str) -> str | None:
     """Marketplace agreement of the underlying model (AVAILABLE / PENDING / NOT_AVAILABLE / ERROR)."""
     prefix, _, rest = model_id.partition(".")
@@ -237,6 +278,10 @@ def cmd_check_models(args) -> None:
         if result["ok"]:
             for hint in result["hints"]:
                 print(f"        note: {hint}")
+            if role == "writer":  # thinking off: only the grammar is in question here
+                schema = check_edition_schema(BedrockClaude(model, sess.region_name, "", "off", 64, client=client))
+                failed = failed or not schema["ok"]
+                print("        edition schema: " + describe_schema_check(schema))
         else:
             failed = True
             print(f"        {result['error']}")
