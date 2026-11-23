@@ -157,6 +157,10 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              - Sid: ServerlessTransform # CloudFormation runs the AWS::Serverless transform with this role
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
               - Sid: AppBuckets
                 Effect: Allow
                 Action: "s3:*"
@@ -190,6 +194,8 @@ Resources:
                   - iam:DetachRolePolicy
                   - iam:ListRolePolicies
                   - iam:ListAttachedRolePolicies
+                  - iam:ListRoleTags
+                  - iam:ListInstanceProfilesForRole
                 Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}*"
               - Sid: PassAppRoles
                 Effect: Allow
