@@ -26,8 +26,8 @@ import sys
 import time
 from pathlib import Path
 
-from awsenv import (ROOT, app_stack, bootstrap_stack, git_sha, outputs, params, registry_prefix, run, session,
-                    tool)
+from awsenv import (DEAD, ROOT, app_stack, bootstrap_stack, explain_stack, git_sha, outputs, params,
+                    previous_parameters, registry_prefix, run, sam_deploy, session, stack_info, tool)
 
 BUILD = ROOT / ".build"
 ASSET_CACHE = "public, max-age=31536000, immutable"
@@ -247,15 +247,26 @@ def cmd_check_models(args) -> None:
     print("all models of this profile answered with the features the agent uses")
 
 
+def bootstrap_overrides(args, previous: dict[str, str]) -> dict[str, str]:
+    """Options not given on a re-run keep the values the stack has. Above all, a GitHub OIDC provider this
+    stack created stays: dropping --create-oidc-provider must not delete it (CI depends on it)."""
+    oidc = "true" if args.create_oidc_provider else previous.get("CreateOidcProvider", "false")
+    if oidc == "true" and not args.create_oidc_provider:
+        print("note: keeping the GitHub OIDC provider this stack created (CreateOidcProvider=true)")
+    return {"GitHubRepository": args.github_repo, "CreateOidcProvider": oidc,
+            "MonthlyBudgetUsd": str(args.budget if args.budget is not None else previous.get("MonthlyBudgetUsd", 30)),
+            "BudgetEmail": args.email if args.email is not None else previous.get("BudgetEmail", ""),
+            "AppName": os.environ.get("STACK_PREFIX", "stock-news-dashboard")}
+
+
 def cmd_bootstrap(args) -> None:
     sess = session(args.region, args.profile)
-    overrides = {"GitHubRepository": args.github_repo, "CreateOidcProvider": "true" if args.create_oidc_provider
-                 else "false", "MonthlyBudgetUsd": str(args.budget), "BudgetEmail": args.email or "",
-                 "AppName": os.environ.get("STACK_PREFIX", "stock-news-dashboard")}
-    run([tool("sam"), "deploy", "--template-file", str(ROOT / "infra" / "bootstrap.yaml"), "--stack-name",
-         bootstrap_stack(), "--region", sess.region_name, "--capabilities", "CAPABILITY_NAMED_IAM",
-         "--no-confirm-changeset", "--no-fail-on-empty-changeset", "--parameter-overrides", *_overrides(overrides)]
-        + (["--profile", args.profile] if args.profile else []))
+    overrides = bootstrap_overrides(args, previous_parameters(sess, bootstrap_stack()))
+    sam_deploy(sess, bootstrap_stack(),
+               [tool("sam"), "deploy", "--template-file", str(ROOT / "infra" / "bootstrap.yaml"), "--stack-name",
+                bootstrap_stack(), "--region", sess.region_name, "--capabilities", "CAPABILITY_NAMED_IAM",
+                "--no-confirm-changeset", "--no-fail-on-empty-changeset", "--parameter-overrides",
+                *_overrides(overrides)] + (["--profile", args.profile] if args.profile else []))
     out = _bootstrap(sess)
     print("\nBootstrap outputs (set these as GitHub repository variables):")
     for key in ("DeployRoleArn", "EvalsRoleArn", "ArtifactsBucketName", "OpsBucketName", "CloudFormationExecRoleArn"):
@@ -301,6 +312,10 @@ def cmd_app(args) -> None:
     sess = session(args.region, args.profile)
     release = args.release or git_sha()
     _check_deployable(sess, args.env, release, args.force)
+    current = stack_info(sess, app_stack(args.env))
+    if current and (current["StackStatus"] in DEAD or (current["StackStatus"].endswith("_IN_PROGRESS")
+                                                      and current["StackStatus"] != "REVIEW_IN_PROGRESS")):
+        raise SystemExit(explain_stack(sess, app_stack(args.env), current))
     boot = _bootstrap(sess)
     packaged = BUILD / release / "packaged.yaml"
     if not packaged.exists():
@@ -323,7 +338,7 @@ def cmd_app(args) -> None:
         cmd += ["--role-arn", boot["CloudFormationExecRoleArn"]]
     if args.profile:
         cmd += ["--profile", args.profile]
-    run(cmd)
+    sam_deploy(sess, app_stack(args.env), cmd)
     _register(sess, args.env, release)
 
 
@@ -394,9 +409,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("bootstrap", help="one-time account setup (OIDC roles, buckets, budget)")
     p.add_argument("--github-repo", required=True, help="OWNER/REPO allowed to deploy through GitHub OIDC")
     p.add_argument("--create-oidc-provider", action="store_true",
-                   help="create the GitHub OIDC provider (skip if the account already has one)")
-    p.add_argument("--budget", type=int, default=30, help="monthly AWS budget alert in USD")
-    p.add_argument("--email", help="email for budget alerts")
+                   help="create the GitHub OIDC provider (skip if the account already has one; a re-run keeps "
+                        "a provider this stack created)")
+    p.add_argument("--budget", type=int, help="monthly AWS budget alert in USD (default 30, or the current value)")
+    p.add_argument("--email", help="email for budget alerts (default: the current value)")
     p.set_defaults(fn=cmd_bootstrap)
     for name, fn, text in (("package", cmd_package, "build and upload a release"),
                            ("app", cmd_app, "deploy the stack for a release"),

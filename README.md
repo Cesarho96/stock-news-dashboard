@@ -106,6 +106,7 @@ Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM
    ```powershell
    python scripts/deploy.py bootstrap --github-repo Cesarho96/stock-news-dashboard --email you@example.com --create-oidc-provider
    ```
+   Run it again whenever `infra/bootstrap.yaml` changes. Options you leave out keep their current values (a provider the stack created is kept). With a named AWS profile, put `--profile NAME` before the command: `python scripts/deploy.py --profile NAME bootstrap ...`.
 4. **Deploy.** Through GitHub (recommended, see section 3), or from your machine:
    ```powershell
    $env:ALARM_EMAIL = "you@example.com"; $env:SEC_USER_AGENT = "Your Name you@example.com"
@@ -115,6 +116,8 @@ Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM
    Confirm the SNS subscription email. `scripts/deploy.ps1 -Env dev -RunNow` does the same from PowerShell.
 
 The first deployment creates the stack directly; every later deployment goes through the CodeDeploy smoke gate.
+
+If a deployment fails, the script prints the stack status and the reason CloudFormation gave. A stack in `REVIEW_IN_PROGRESS` was never created (its first change set was rejected): fix the cause and deploy again, there is nothing to delete. A stack in `ROLLBACK_COMPLETE` must be deleted before the next attempt; the message prints the command.
 
 ### Stack parameters (`infra/params/<env>.json`)
 

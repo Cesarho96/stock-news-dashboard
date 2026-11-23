@@ -92,3 +92,132 @@ def test_check_model_explains_access_problems(code, message, expected):
                         client=ScriptedBedrock([FakeClientError(code, message)]))
     result = deploy.check_model(llm)
     assert not result["ok"] and code in result["error"] and expected in result["advice"]
+
+
+# ---- stack state messages (scripts/awsenv.py) --------------------------------------------------
+class FakeCF:
+    def __init__(self, stack=None, events=(), change_sets=()):
+        self.stack, self.events, self.change_sets = stack, list(events), list(change_sets)
+
+    def list_change_sets(self, StackName):
+        return {"Summaries": self.change_sets}
+
+    def describe_stacks(self, StackName):
+        if self.stack is None:
+            raise Exception(f"An error occurred (ValidationError): Stack with id {StackName} does not exist")
+        return {"Stacks": [self.stack]}
+
+    def get_paginator(self, name):
+        events = self.events
+
+        class P:
+            def paginate(self, StackName):
+                yield {"StackEvents": events}
+
+        return P()
+
+
+class FakeSession:
+    region_name, profile_name = "us-east-1", "personal"
+
+    def __init__(self, cf):
+        self.cf = cf
+
+    def client(self, name):
+        return self.cf
+
+
+def test_stack_outputs_explain_unfinished_or_failed_stacks():
+    import awsenv
+
+    with pytest.raises(SystemExit, match="not found in us-east-1"):
+        awsenv.outputs(FakeSession(FakeCF()), "snd-dev")
+    with pytest.raises(SystemExit, match="still working on it"):
+        awsenv.outputs(FakeSession(FakeCF({"StackStatus": "CREATE_IN_PROGRESS"})), "snd-dev")
+    failed = FakeCF({"StackStatus": "ROLLBACK_COMPLETE"}, [
+        {"LogicalResourceId": "snd-dev", "ResourceStatus": "ROLLBACK_IN_PROGRESS", "ResourceStatusReason": "x"},
+        {"LogicalResourceId": "Distribution", "ResourceStatus": "CREATE_FAILED",
+         "ResourceStatusReason": "Resource creation cancelled"},
+        {"LogicalResourceId": "NewsAgentFunctionRole", "ResourceStatus": "CREATE_FAILED",
+         "ResourceStatusReason": "User is not authorized to perform: iam:CreateRole"},
+    ])
+    with pytest.raises(SystemExit) as err:
+        awsenv.outputs(FakeSession(failed), "snd-dev")
+    text = str(err.value)
+    assert "is ROLLBACK_COMPLETE" in text and "NewsAgentFunctionRole: User is not authorized" in text
+    assert "aws cloudformation delete-stack --stack-name snd-dev --region us-east-1 --profile personal" in text
+    ready = awsenv.outputs(FakeSession(FakeCF({"StackStatus": "CREATE_COMPLETE", "Outputs": [
+        {"OutputKey": "SiteBucketName", "OutputValue": "b"}]})), "snd-dev")
+    assert ready["SiteBucketName"] == "b" and ready.get("Missing") is None
+    with pytest.raises(SystemExit, match="has no output 'NewsAgentFunctionName'"):
+        ready["NewsAgentFunctionName"]
+
+
+TRANSFORM_DENIED = ("User: arn:aws:sts::123456789012:assumed-role/stock-news-dashboard-bootstrap-CloudFormationExecRole"
+                    "-AbC/AWSCloudFormation is not authorized to perform: cloudformation:CreateChangeSet on resource: "
+                    "arn:aws:cloudformation:us-east-1:aws:transform/Serverless-2016-10-31")
+
+
+def test_review_in_progress_shows_the_rejected_change_set_and_needs_no_delete():
+    import awsenv
+
+    cf = FakeCF({"StackStatus": "REVIEW_IN_PROGRESS", "StackStatusReason": "User Initiated"}, change_sets=[
+        {"ChangeSetName": "samcli-deploy1", "Status": "FAILED", "CreationTime": "2026-11-22 10:00:00+00:00",
+         "StatusReason": "older failure"},
+        {"ChangeSetName": "samcli-deploy2", "Status": "FAILED", "CreationTime": "2026-11-23 10:00:00+00:00",
+         "StatusReason": TRANSFORM_DENIED},
+    ])
+    with pytest.raises(SystemExit) as err:
+        awsenv.outputs(FakeSession(cf), "snd-dev")
+    text = str(err.value)
+    assert "samcli-deploy2: User: arn:aws:sts" in text and "older failure" not in text
+    assert "Update the bootstrap stack" in text and "nothing to delete" in text and "delete-stack" not in text
+    never_executed = FakeCF({"StackStatus": "REVIEW_IN_PROGRESS"})
+    with pytest.raises(SystemExit, match="never executed"):
+        awsenv.outputs(FakeSession(never_executed), "snd-dev")
+
+
+def test_empty_change_sets_are_not_reported_as_rejections():
+    import awsenv
+
+    cf = FakeCF({"StackStatus": "UPDATE_COMPLETE"}, change_sets=[
+        {"ChangeSetName": "samcli-deploy3", "Status": "FAILED", "CreationTime": "2026-11-23 10:00:00+00:00",
+         "StatusReason": "The submitted information didn't contain changes. Submit different information to "
+                         "create a change set."}])
+    assert awsenv.rejected_change_set(FakeSession(cf), "snd-dev") is None
+
+
+def test_failed_sam_deploy_explains_the_stack(monkeypatch):
+    import subprocess
+
+    import awsenv
+
+    def boom(cmd, **kw):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(awsenv, "run", boom)
+    cf = FakeCF({"StackStatus": "UPDATE_ROLLBACK_COMPLETE"}, [
+        {"LogicalResourceId": "NewsAgentFunctionAliaslive", "ResourceStatus": "UPDATE_FAILED",
+         "ResourceStatusReason": "CodeDeploy deployment failed: the PreTraffic hook reported Failed"}])
+    with pytest.raises(SystemExit) as err:
+        awsenv.sam_deploy(FakeSession(cf), "snd-dev", ["sam", "deploy"])
+    text = str(err.value)
+    assert text.startswith("sam deploy failed") and "PreTraffic hook reported Failed" in text
+    assert "previous release is still live" in text
+
+
+def test_bootstrap_rerun_keeps_the_oidc_provider_and_current_values():
+    import argparse
+
+    rerun = argparse.Namespace(github_repo="o/r", create_oidc_provider=False, budget=None, email=None)
+    previous = {"CreateOidcProvider": "true", "MonthlyBudgetUsd": "50", "BudgetEmail": "me@example.com"}
+    values = deploy.bootstrap_overrides(rerun, previous)
+    assert values["CreateOidcProvider"] == "true" and values["MonthlyBudgetUsd"] == "50"
+    assert values["BudgetEmail"] == "me@example.com"
+    first = deploy.bootstrap_overrides(argparse.Namespace(github_repo="o/r", create_oidc_provider=False, budget=None,
+                                                          email="me@example.com"), {})
+    assert first["CreateOidcProvider"] == "false" and first["MonthlyBudgetUsd"] == "30"
+    explicit = deploy.bootstrap_overrides(argparse.Namespace(github_repo="o/r", create_oidc_provider=True, budget=20,
+                                                             email=""), previous)
+    assert explicit["CreateOidcProvider"] == "true" and explicit["MonthlyBudgetUsd"] == "20"
+    assert explicit["BudgetEmail"] == ""
