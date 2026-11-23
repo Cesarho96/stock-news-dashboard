@@ -218,16 +218,17 @@ def test_failed_sam_deploy_explains_the_stack(monkeypatch):
 def test_bootstrap_rerun_keeps_the_oidc_provider_and_current_values():
     import argparse
 
-    rerun = argparse.Namespace(github_repo="o/r", create_oidc_provider=False, budget=None, email=None)
+    rerun = argparse.Namespace(github_repo="o/r", create_oidc_provider=False, budget=None, email=None,
+                               github_sub_prefix=None)
     previous = {"CreateOidcProvider": "true", "MonthlyBudgetUsd": "50", "BudgetEmail": "me@example.com"}
     values = deploy.bootstrap_overrides(rerun, previous)
     assert values["CreateOidcProvider"] == "true" and values["MonthlyBudgetUsd"] == "50"
     assert values["BudgetEmail"] == "me@example.com"
     first = deploy.bootstrap_overrides(argparse.Namespace(github_repo="o/r", create_oidc_provider=False, budget=None,
-                                                          email="me@example.com"), {})
+                                                          email="me@example.com", github_sub_prefix=None), {})
     assert first["CreateOidcProvider"] == "false" and first["MonthlyBudgetUsd"] == "30"
     explicit = deploy.bootstrap_overrides(argparse.Namespace(github_repo="o/r", create_oidc_provider=True, budget=20,
-                                                             email=""), previous)
+                                                             email="", github_sub_prefix=None), previous)
     assert explicit["CreateOidcProvider"] == "true" and explicit["MonthlyBudgetUsd"] == "20"
     assert explicit["BudgetEmail"] == ""
 
@@ -316,3 +317,58 @@ def test_github_setup_without_the_cli_prints_the_values(monkeypatch, capsys):
     assert "winget install --id GitHub.cli" in out and "https://github.com/o/r/settings/variables/actions" in out
     assert "AWS_ROLE_ARN" in out and "arn:aws:iam::1:role/deploy" in out and "Required reviewers" in out
     assert "settings/secrets/actions" in out and "ALARM_EMAIL" in out
+
+
+def test_bootstrap_trusts_the_oidc_subject_github_issues():
+    import argparse
+
+    args = argparse.Namespace(github_repo="Owner/repo", create_oidc_provider=False, budget=None, email=None,
+                              github_sub_prefix=None)
+    # repositories created after July 15, 2026: immutable owner and repository IDs, read with the GitHub CLI
+    detected = deploy.bootstrap_overrides(args, {}, "repo:Owner@111/repo@222")
+    assert detected["GitHubSubjectPrefix"] == "repo:Owner@111/repo@222"
+    # a re-run without the CLI keeps the prefix the stack has; nothing known: the classic format
+    assert deploy.bootstrap_overrides(args, {"GitHubSubjectPrefix": "repo:Owner@111/repo@222"})[
+        "GitHubSubjectPrefix"] == "repo:Owner@111/repo@222"
+    assert deploy.bootstrap_overrides(args, {})["GitHubSubjectPrefix"] == ""
+    args.github_sub_prefix = "repo:Owner@111/other@333"
+    with pytest.raises(SystemExit, match="belongs to another repository"):
+        deploy.bootstrap_overrides(args, {})
+
+
+def test_bootstrap_template_trusts_the_subject_prefix():
+    from cfnlint.decode import decode
+
+    tpl, errors = decode(str(ROOT / "infra" / "bootstrap.yaml"))
+    assert not errors
+    pattern = tpl["Parameters"]["GitHubSubjectPrefix"]["AllowedPattern"]
+    import re as _re
+    assert _re.fullmatch(pattern, "repo:Cesarho96@1234/stock-news-dashboard@5678")
+    assert _re.fullmatch(pattern, "") and not _re.fullmatch(pattern, "repo:o/r:ref:refs/heads/main")
+    for role, suffixes in (("GitHubDeployRole", {"ref:refs/heads/main", "environment:dev", "environment:production"}),
+                           ("GitHubEvalsRole", {"pull_request", "ref:refs/heads/*"})):
+        statement = tpl["Resources"][role]["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]
+        subjects = statement["Condition"]["StringLike"]["token.actions.githubusercontent.com:sub"]
+        assert {s["Fn::Sub"][0].split(":", 1)[1] for s in subjects} == suffixes
+        assert all(s["Fn::Sub"][1]["Subject"]["Fn::If"][1] == {"Ref": "GitHubSubjectPrefix"} for s in subjects)
+
+
+def test_github_setup_warns_when_the_roles_trust_another_subject(monkeypatch, capsys):
+    import argparse
+    import subprocess
+
+    def fake_gh(args, body=None):
+        if args[:2] == ["api", "repos/o/r/actions/oidc/customization/sub"]:
+            return subprocess.CompletedProcess(args, 0, "repo:o@1/r@2\n", "")
+        return subprocess.CompletedProcess(args, 0, "7\n" if args[:2] == ["api", "user"] else "", "")
+
+    monkeypatch.setattr(deploy, "gh", fake_gh)
+    monkeypatch.setattr(deploy.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(deploy, "session", lambda region, profile: FakeSession(FakeCF()))
+    monkeypatch.setattr(deploy, "_bootstrap", lambda sess: BOOT)
+    monkeypatch.setattr(deploy, "previous_parameters", lambda sess, stack: {"GitHubRepository": "o/r"})
+    deploy.cmd_github_setup(argparse.Namespace(region=None, profile=None, repo=None, alarm_email="", sec_user_agent="",
+                                               dry_run=False))
+    out = capsys.readouterr().out
+    assert "GitHub issues OIDC subjects starting with repo:o@1/r@2, but the CI roles trust repo:o/r" in out
+    assert "python scripts/deploy.py bootstrap --github-repo o/r" in out
