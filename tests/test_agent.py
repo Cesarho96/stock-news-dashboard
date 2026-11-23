@@ -10,7 +10,7 @@ from stocknews.agent import NewsAgent, parse_json_text
 from stocknews.collect import collect_all
 from stocknews.llm import BedrockClaude, LLMError
 from stocknews.market import coverage
-from stocknews.schema import analysis_schema
+from stocknews.schema import analysis_schema, tool_definitions
 from stocknews.tools import ResearchTools
 from stocknews.validate import ValidationContext, validate_analysis
 
@@ -128,6 +128,39 @@ def test_llm_request_shape_and_feature_downgrades():
     assert llm.usage["calls"] == 1 and llm.estimated_cost(2.0, 10.0) > 0
 
 
+GRAMMAR_TOO_LARGE = ("The compiled grammar is too large, which would cause performance issues. Simplify your tool "
+                     "schemas or reduce the number of strict tools.")
+
+
+def test_llm_drops_strict_then_format_when_the_grammar_is_too_large():
+    fake = ScriptedBedrock([FakeClientError("ValidationException", GRAMMAR_TOO_LARGE),
+                            FakeClientError("ValidationException", GRAMMAR_TOO_LARGE),
+                            text_response({"ok": True}), text_response("note")])
+    llm = BedrockClaude("global.anthropic.claude-haiku-4-5-20251001-v1:0", "us-east-1", effort="", thinking="off",
+                        client=fake)
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"],
+              "additionalProperties": False}
+    messages = [{"role": "user", "content": [{"type": "text", "text": "write"}]}]
+    llm.create(system="s", messages=messages, tools=[{"name": "t", "description": "d", "input_schema": {"type": "object"}}],
+               tool_choice={"type": "none"}, output_schema=schema)
+    first, second, third = fake.requests[:3]
+    assert first["tools"][0]["strict"] is True and first["output_config"]["format"]["schema"] == schema
+    assert "strict" not in second["tools"][0] and second["output_config"]["format"]["schema"] == schema
+    assert "output_config" not in third and "strict" not in third["tools"][0]
+    last = third["messages"][-1]["content"]
+    assert last[0]["text"] == "write" and last[-1]["text"].startswith("Return ONLY the JSON object")
+    assert json.loads(last[-1]["text"].split("\n", 1)[1]) == schema
+    assert messages == [{"role": "user", "content": [{"type": "text", "text": "write"}]}]  # caller's list untouched
+    assert llm.downgrades == ["strict", "format"] and not llm.structured_output
+    llm.create(system="s", messages=[{"role": "user", "content": "research"}])  # no schema: nothing appended
+    assert fake.requests[-1]["messages"] == [{"role": "user", "content": "research"}]
+
+
+def test_schemas_have_no_regex_patterns():
+    blob = json.dumps([analysis_schema(["AAPL", "NVDA"], ["NFLX"], ["technology"]), tool_definitions()])
+    assert '"pattern"' not in blob  # patterns enlarge the grammar; the validator checks formats
+
+
 def test_llm_raises_on_access_denied():
     fake = ScriptedBedrock([FakeClientError("AccessDeniedException", "not authorized")])
     llm = BedrockClaude("m", "us-east-1", client=fake)
@@ -195,6 +228,30 @@ def test_agent_without_tools_falls_back_to_prompt_schema(ctx, cfg, settings, wor
     assert llm.downgrades == ["effort", "format"]
     assert "output_config" not in fake.requests[-1]
     assert len(fake.requests[0]["messages"]) == 1  # no research phase
+
+
+def test_agent_writes_with_the_schema_in_the_prompt_when_the_grammar_is_too_large(ctx, cfg, settings, world):
+    snapshot, pool = world
+    settings.research_tools = False
+    draft = good_analysis(cfg, pool, snapshot)
+    draft["top20"] = draft["top20"][:-1]  # one missing note -> a repair round without structured output
+    fake = ScriptedBedrock([
+        FakeClientError("ValidationException", GRAMMAR_TOO_LARGE),
+        text_response(draft),
+        text_response(good_analysis(cfg, pool, snapshot)),
+    ])
+    llm = BedrockClaude(settings.model_id, "us-east-1", effort="", thinking="off", client=fake)
+    result = NewsAgent(llm, settings, tools=None).run(ctx, cfg, snapshot, pool)
+    assert result.report.ok and result.repairs == 1 and llm.downgrades == ["format"]
+    write, repair = fake.requests[1], fake.requests[2]
+    for request in (write, repair):
+        assert "output_config" not in request
+        schema_text = request["messages"][-1]["content"][-1]["text"]
+        assert schema_text.startswith("Return ONLY the JSON object") and '"top20"' in schema_text
+    assert "missing notes for" in repair["messages"][-1]["content"][0]["text"]
+    # the schema is described once per request, in the last user turn only
+    assert sum("must match this JSON schema" in b.get("text", "") for m in repair["messages"] if m["role"] == "user"
+               for b in m["content"]) == 1
 
 
 def test_agent_stops_when_lambda_time_is_short(ctx, cfg, settings, world, fake_fh):

@@ -221,3 +221,22 @@ def test_bootstrap_rerun_keeps_the_oidc_provider_and_current_values():
                                                              email=""), previous)
     assert explicit["CreateOidcProvider"] == "true" and explicit["MonthlyBudgetUsd"] == "20"
     assert explicit["BudgetEmail"] == ""
+
+
+def test_check_models_reports_whether_the_edition_schema_compiles():
+    grammar = FakeClientError("ValidationException", "The compiled grammar is too large, which would cause "
+                                                     "performance issues. Simplify your tool schemas.")
+    fits = deploy.check_edition_schema(BedrockClaude("m", "us-east-1", "", "off", 64,
+                                                     client=ScriptedBedrock([text_response("{")])))
+    assert fits["ok"] and fits["structured"] and fits["strict"]
+    assert "compiles for structured output, with strict" in deploy.describe_schema_check(fits)
+    fake = ScriptedBedrock([grammar, grammar, text_response("{")])
+    too_big = deploy.check_edition_schema(BedrockClaude("m", "us-east-1", "", "off", 64, client=fake))
+    assert too_big["ok"] and not too_big["structured"] and not too_big["strict"]
+    assert "describes the schema in the prompt" in deploy.describe_schema_check(too_big)
+    sent = fake.requests[0]
+    assert sent["output_config"]["format"]["schema"]["properties"]["top20"]["items"]["properties"]["ticker"]["enum"]
+    assert [t["name"] for t in sent["tools"]] == ["get_company_news", "get_quotes"] and sent["max_tokens"] == 64
+    denied = deploy.check_edition_schema(BedrockClaude("m", "us-east-1", "", "off", 64, client=ScriptedBedrock([
+        FakeClientError("ThrottlingException", "Too many tokens")])))
+    assert not denied["ok"] and "Service Quotas" in denied["advice"]
