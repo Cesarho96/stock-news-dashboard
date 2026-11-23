@@ -1,8 +1,7 @@
 {
   "_comment": "Parameters for the dev stack (stock-news-dashboard-dev). scripts/deploy.py adds Environment, ReleaseId and OpsBucketName; the ALARM_EMAIL and SEC_USER_AGENT environment variables (GitHub variables in CI) override AlarmEmail and SecUserAgent.",
-  "ModelId": "global.anthropic.claude-sonnet-5-5",
-  "Effort": "medium",
-  "JudgeModelId": "global.anthropic.claude-haiku-5-5",
+  "ModelProfile": "haiku-4-5",
+  "_modelProfileComment": "Models come from infra/models.json. 'haiku-4-5' is the interim profile while the account only has Claude Haiku 4.5; switch to 'target' (Claude Sonnet 5.5 writer, Claude Haiku 5.5 judge) once check-models passes for it.",
   "JudgeEnabled": "true",
   "QualityFloor": "0.6",
   "QualityTarget": "0.8",

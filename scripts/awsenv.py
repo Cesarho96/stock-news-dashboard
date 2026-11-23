@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -44,10 +43,12 @@ def outputs(sess, stack: str) -> dict[str, str]:
     return {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
 
 
-def params(env: str) -> dict[str, str]:
-    path = ROOT / "infra" / "params" / f"{env}.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {k: str(v) for k, v in data.items() if not k.startswith("_")}
+def params(env: str, model_profile: str | None = None) -> dict[str, str]:
+    """Stack parameters of an environment, with its model profile (infra/models.json) expanded."""
+    from stocknews.stackparams import load_stack_params
+
+    return load_stack_params(ROOT / "infra" / "params" / f"{env}.json", ROOT / "infra" / "models.json",
+                             model_profile=model_profile)
 
 
 def tool(name: str) -> str:

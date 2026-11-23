@@ -7,7 +7,8 @@
   python scripts/deploy.py site --env dev [--release SHA]  # releases/<SHA>/ + index.html switch
   python scripts/deploy.py release --env prod           # package (if needed) + app + site, for local use
   python scripts/deploy.py run --env dev [--slot close] # publish an edition now
-  python scripts/deploy.py validate                     # cfn-lint + SAM transform check (no AWS calls)
+  python scripts/deploy.py validate                     # cfn-lint + SAM transform + parameter checks (no AWS calls)
+  python scripts/deploy.py check-models --env prod [--model-profile target]   # Bedrock access preflight
 
 Needs: Python 3.10+, boto3, the AWS SAM CLI and AWS credentials (or the GitHub OIDC role in CI).
 Release id = the git commit SHA. Parameters per environment live in infra/params/<env>.json;
@@ -22,6 +23,7 @@ import mimetypes
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from awsenv import (ROOT, app_stack, bootstrap_stack, git_sha, outputs, params, registry_prefix, run, session,
@@ -95,6 +97,7 @@ def cmd_validate(args) -> None:
             return {}
 
     sam = yaml_parse((ROOT / "template.yaml").read_text(encoding="utf-8"))
+    check_parameters(sam["Parameters"])
     for res in sam["Resources"].values():  # what `sam package` does: local code -> S3 object
         if res["Type"] == "AWS::Serverless::Function":
             res["Properties"]["CodeUri"] = "s3://artifacts-bucket-example/releases/example/agent.zip"
@@ -106,6 +109,142 @@ def cmd_validate(args) -> None:
             if needed not in kinds:
                 raise SystemExit(f"SAM transform for {env}: missing {needed}")
         print(f"SAM transform OK for {env}: {len(out['Resources'])} resources")
+
+
+def check_parameters(template_params: dict) -> None:
+    """Every environment's parameters and every model profile must fit the template's
+    AllowedValues / AllowedPattern, so a typo fails in CI instead of at deploy time."""
+    from stocknews.stackparams import load_profiles
+
+    problems = []
+
+    def check(label: str, values: dict[str, str]) -> None:
+        for key, value in values.items():
+            spec = template_params.get(key)
+            if spec is None:
+                problems.append(f"{label}: '{key}' is not a parameter of template.yaml")
+                continue
+            allowed = [str(a) for a in spec.get("AllowedValues", [])]
+            if allowed and value not in allowed:
+                problems.append(f"{label}: {key}={value!r} is not one of {allowed}")
+            pattern = spec.get("AllowedPattern")
+            if pattern and not re.fullmatch(pattern, value):
+                problems.append(f"{label}: {key}={value!r} does not match {pattern}")
+
+    for env in ("dev", "prod"):
+        check(f"infra/params/{env}.json", params(env))
+    for name, values in load_profiles(ROOT / "infra" / "models.json").items():
+        check(f"infra/models.json [{name}]", values)
+    if problems:
+        raise SystemExit("parameter problems:\n  " + "\n  ".join(problems))
+    print("parameters OK: infra/params/*.json and every profile in infra/models.json fit template.yaml")
+
+
+# ---- Bedrock access preflight -----------------------------------------------------------------
+CHECK_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["ok"],
+                "properties": {"ok": {"type": "boolean"}}}
+CHECK_TOOL = {"name": "noop", "description": "Not needed for this request; present to test tool support.",
+              "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
+FEATURE_HINTS = {
+    "effort": "the model rejected the effort parameter: set Effort / JudgeEffort to none in its model profile",
+    "thinking": "the model rejected adaptive thinking: set Thinking / JudgeThinking to off in its model profile",
+    "format": "no structured outputs with this model/profile: the agent falls back to a schema in the prompt "
+              "(more repair rounds); prefer a model or inference profile with structured outputs",
+    "strict": "no strict tool use: tools still work without it",
+}
+
+
+def access_advice(message: str) -> str:
+    msg = message.lower()
+    if "use case" in msg or "use-case" in msg:
+        return ("Submit Anthropic's one-time use-case form: Bedrock console > Model catalog > pick an Anthropic "
+                "model > Submit use case details. Access is usually immediate (allow up to 15 minutes).")
+    if "accessdenied" in msg.replace(" ", "") or "access denied" in msg or "don't have access" in msg:
+        if "marketplace" in msg:
+            return ("The identity making the first call needs aws-marketplace:Subscribe, aws-marketplace:Unsubscribe "
+                    "and aws-marketplace:ViewSubscriptions (an administrator has them). Run check-models with it.")
+        return ("No access yet. Open the model in the Bedrock console (Model catalog > the model > Open in "
+                "playground) and send one prompt, or run this check with an administrator identity: the first "
+                "call subscribes the account through AWS Marketplace (up to 2 minutes; pay per use, no upfront "
+                "cost). If it still says access denied after that, access to this model is restricted for your "
+                "account; the Bedrock documentation says to contact AWS Sales (or your AWS account team).")
+    if "throttl" in msg or "quota" in msg or "too many" in msg:
+        return ("The account's quota for this model is too low (new accounts can start near zero). Service Quotas "
+                "console > Amazon Bedrock > search the model name > request more tokens and requests per minute for "
+                "the inference profile you use (global or us).")
+    if "model identifier" in msg or "inference profile" in msg or (
+            "model" in msg and ("invalid" in msg or "supported" in msg)):
+        return ("Check the model id in infra/models.json: the newest models need an inference profile id "
+                "(global.* or us.*) and must be offered in this region.")
+    return "See the error above."
+
+
+def check_model(llm) -> dict:
+    """One tiny request with the features the agent uses: structured output, strict tools with
+    tool_choice none, effort and thinking. Dropped features are reported with a fix."""
+    started = time.monotonic()
+    try:
+        llm.create(system="You answer health checks.",
+                   messages=[{"role": "user", "content": [{"type": "text", "text": 'Reply with {"ok": true}.'}]}],
+                   tools=[CHECK_TOOL], tool_choice={"type": "none"}, output_schema=CHECK_SCHEMA)
+    except Exception as exc:  # LLMError carries the Bedrock code and message
+        return {"ok": False, "error": str(exc), "advice": access_advice(str(exc)),
+                "seconds": round(time.monotonic() - started, 1)}
+    return {"ok": True, "dropped": list(llm.downgrades), "hints": [FEATURE_HINTS[f] for f in llm.downgrades],
+            "seconds": round(time.monotonic() - started, 1)}
+
+
+def agreement_status(sess, model_id: str) -> str | None:
+    """Marketplace agreement of the underlying model (AVAILABLE / PENDING / NOT_AVAILABLE / ERROR)."""
+    prefix, _, rest = model_id.partition(".")
+    base = rest if prefix in ("global", "us", "eu", "apac", "au", "jp", "ca", "in", "us-gov") else model_id
+    try:
+        resp = sess.client("bedrock").get_foundation_model_availability(modelId=base)
+        return (resp.get("agreementAvailability") or {}).get("status")
+    except Exception:  # older boto3 or no permission: not essential
+        return None
+
+
+def cmd_check_models(args) -> None:
+    from botocore.config import Config
+
+    from stocknews.llm import BedrockClaude
+
+    sess = session(args.region, args.profile)
+    values = params(args.env, args.model_profile)
+    chosen = args.model_profile or json.loads(
+        (ROOT / "infra" / "params" / f"{args.env}.json").read_text(encoding="utf-8")).get("ModelProfile", "-")
+    client = sess.client("bedrock-runtime", config=Config(read_timeout=120, connect_timeout=10,
+                                                          retries={"max_attempts": 2, "mode": "standard"}))
+    print(f"model profile: {chosen} · environment: {args.env} · region: {sess.region_name}\n")
+    roles = [("writer", values.get("ModelId", ""), values.get("Effort", ""), values.get("Thinking", "adaptive"))]
+    if str(values.get("JudgeEnabled", "true")).lower() == "true":
+        roles.append(("judge", values.get("JudgeModelId", ""), values.get("JudgeEffort", ""),
+                      values.get("JudgeThinking", "adaptive")))
+    failed, seen = False, {}
+    for role, model, effort, thinking in roles:
+        key = (model, effort, thinking)
+        if key in seen:
+            print(f"{role:7} same model and settings as the {seen[key]}\n")
+            continue
+        seen[key] = role
+        effort = "" if str(effort).lower() in ("", "none", "off") else effort
+        llm = BedrockClaude(model, sess.region_name, effort, thinking or "adaptive", 512, client=client)
+        result = check_model(llm)
+        status = agreement_status(sess, model)
+        line = f"{role:7} {model}  " + (f"OK ({result['seconds']}s)" if result["ok"] else "FAILED")
+        print(line + (f" · Marketplace agreement: {status}" if status else ""))
+        if result["ok"]:
+            for hint in result["hints"]:
+                print(f"        note: {hint}")
+        else:
+            failed = True
+            print(f"        {result['error']}")
+            print(f"        what to do: {result['advice']}")
+        print()
+    if failed:
+        raise SystemExit(1)
+    print("all models of this profile answered with the features the agent uses")
 
 
 def cmd_bootstrap(args) -> None:
@@ -272,6 +411,10 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--no-exec-role", action="store_true",
                            help="deploy with your own credentials instead of the CloudFormation execution role")
         p.set_defaults(fn=fn)
+    p = sub.add_parser("check-models", help="check Bedrock access to the writer and judge models")
+    p.add_argument("--env", required=True, choices=["dev", "prod"])
+    p.add_argument("--model-profile", help="check another profile of infra/models.json (e.g. target)")
+    p.set_defaults(fn=cmd_check_models)
     p = sub.add_parser("run", help="publish an edition now")
     p.add_argument("--env", required=True, choices=["dev", "prod"])
     p.add_argument("--slot", choices=["premarket", "midday", "close", "weekend"])

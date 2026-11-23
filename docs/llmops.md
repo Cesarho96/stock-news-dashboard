@@ -25,7 +25,7 @@ A **release** is one git commit SHA. It consists of:
 | Part | Where | Immutable? |
 |---|---|---|
 | Agent code, prompts (`PROMPT_VERSION` + fingerprint), JSON schema, validator, quality gate, `watchlist.json` | Lambda **version** (published by SAM `AutoPublishAlias`) | yes |
-| Writer and judge model ids, effort, language, quality thresholds | the same Lambda version (environment variables) | yes |
+| Writer and judge model ids, effort, thinking, prices (a **model profile** from `infra/models.json`), language, quality thresholds | the same Lambda version (environment variables) | yes |
 | Site (index.html, JS, CSS) | `releases/<sha>/` in the site bucket | yes |
 | Packaged template + code zip + site bundle | `s3://<artifacts>/releases/<sha>/` | yes (built once, deployed to dev and prod) |
 | Infrastructure | CloudFormation stack `stock-news-dashboard-<env>` | CloudFormation rolls back failed updates |
@@ -172,10 +172,13 @@ Start with `python scripts/release.py status --env prod` (or **operate** → `st
 
 **A bad edition is visible.** **operate** → `withdraw` (edition id from the page URL `?edition=…` or `status`), then rollback or kill switch as appropriate.
 
+**Changing models** (for example from the interim `haiku-4-5` profile back to `target`). Run `check-models --model-profile target`; evaluate the candidate on the golden set with `python -m stocknews.evals --params ../infra/params/prod.json --model-profile target`; then change `ModelProfile` in the params files through a PR. The eval gate compares it with the last good release, the smoke test runs it before it goes live, and the bake decides whether it becomes the new last good release; a regression during the bake rolls back to the previous models automatically. Edit thresholds only through a reviewed PR, not to make a weaker model pass.
+
 ## 7. Preventive strategies
 
 - **Eval gate on every change that touches the agent** (PR workflow) and before every deployment (release workflow), with regression checks against the last good release.
 - **Same artifact in dev and prod** (build once), and production behind an approval.
+- **Model access preflight and model profiles:** `python scripts/deploy.py check-models --env prod [--model-profile …]` proves access and feature support (structured outputs, strict tools, effort, thinking) before a model change; profiles in `infra/models.json` are validated against the template in CI, and a model change is a release like any other.
 - **Smoke test inside the deployment:** the new Lambda version writes the seed edition with the real models before the alias moves; a failure keeps the old version live.
 - **Bake before trust:** a release only becomes the rollback target after N good production editions.
 - **Blocked releases:** a rolled-back SHA cannot be redeployed by accident.

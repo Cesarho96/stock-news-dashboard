@@ -22,6 +22,7 @@ from ..compose import model_label
 from ..llm import BedrockClaude
 from ..pipeline import produce
 from ..settings import Settings, load_config
+from ..stackparams import load_stack_params
 from ..storage import read_json, write_json
 from .dataset import ReplayFinnhub, load_cases, materialize
 from .judge import judge_client
@@ -99,18 +100,26 @@ def run_suite(specs: list[str], settings: Settings, cfg: dict | None = None, gat
 
 
 def apply_params(settings: Settings, params: dict) -> str | None:
-    """Use a stack's parameter file (infra/params/<env>.json) so CI evaluates what will be deployed.
-    Returns the stack language."""
+    """Use a stack's parameters (infra/params/<env>.json, model profile expanded) so CI evaluates
+    exactly what will be deployed. Returns the stack language."""
+    def effort(value, current):
+        v = str(value if value is not None else current or "").strip().lower()
+        return "" if v in ("", "none", "off") else v
+
     settings.model_id = params.get("ModelId") or settings.model_id
-    effort = str(params.get("Effort") or settings.effort or "").lower()
-    settings.effort = "" if effort in ("", "none") else effort
+    settings.effort = effort(params.get("Effort"), settings.effort)
+    settings.thinking = str(params.get("Thinking") or settings.thinking).strip().lower()
     settings.judge_model_id = params.get("JudgeModelId") or settings.judge_model_id
+    settings.judge_effort = effort(params.get("JudgeEffort"), settings.judge_effort)
+    settings.judge_thinking = str(params.get("JudgeThinking") or settings.judge_thinking).strip().lower()
     if "JudgeEnabled" in params:
         settings.judge_enabled = str(params["JudgeEnabled"]).lower() == "true"
-    if params.get("QualityFloor"):
-        settings.quality_floor = float(params["QualityFloor"])
-    if params.get("QualityTarget"):
-        settings.quality_target = float(params["QualityTarget"])
+    for key, attr in (("QualityFloor", "quality_floor"), ("QualityTarget", "quality_target"),
+                      ("PriceInputMtok", "price_input_mtok"), ("PriceOutputMtok", "price_output_mtok"),
+                      ("JudgePriceInputMtok", "judge_price_input_mtok"),
+                      ("JudgePriceOutputMtok", "judge_price_output_mtok")):
+        if params.get(key):
+            setattr(settings, attr, float(params[key]))
     return params.get("Language")
 
 
@@ -168,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--language", choices=["en", "es"], help="override the language of every case")
     parser.add_argument("--params", help="evaluate the configuration of a stack: infra/params/<env>.json "
                                          "(ModelId, Effort, JudgeModelId, JudgeEnabled, Language, quality thresholds)")
+    parser.add_argument("--model-profile", help="with --params: evaluate another profile of infra/models.json "
+                                                "(e.g. target) instead of the one the params file selects")
     parser.add_argument("--model", help="override MODEL_ID")
     parser.add_argument("--judge-model", help="override JUDGE_MODEL_ID")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -180,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     settings.environment = os.environ.get("ENVIRONMENT", "ci")
     language = args.language
     if args.params:
-        language = apply_params(settings, json.loads(Path(args.params).read_text(encoding="utf-8"))) or language
+        language = apply_params(settings, load_stack_params(args.params, model_profile=args.model_profile)) or language
     if args.model:
         settings.model_id = args.model
     if args.judge_model:

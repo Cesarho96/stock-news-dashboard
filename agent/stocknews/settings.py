@@ -27,6 +27,12 @@ def _int(value: str | None, default: int) -> int:
         return default
 
 
+def _thinking(value: str | None, default: str) -> str:
+    """'adaptive' or 'off' (models without adaptive thinking, e.g. Claude Haiku 4.5)."""
+    v = (value or default or "").strip().lower()
+    return "off" if v in ("off", "none", "false", "disabled", "0", "") else v
+
+
 def _float(value: str | None, default: float) -> float:
     try:
         return float(value) if value not in (None, "") else default
@@ -78,6 +84,7 @@ class Settings:
     judge_enabled: bool = True
     judge_model_id: str = "global.anthropic.claude-haiku-5-5"
     judge_effort: str = "low"
+    judge_thinking: str = "adaptive"  # adaptive | off
     quality_floor: float = 0.6  # groundedness below this -> AI text withheld (fallback edition)
     quality_target: float = 0.8  # groundedness below this -> edition flagged as degraded
     bake_editions: int = 3  # good editions needed before a release becomes "last good"
@@ -95,7 +102,7 @@ class Settings:
         s.bedrock_region = env.get("BEDROCK_REGION") or env.get("AWS_REGION") or s.bedrock_region
         effort = (env.get("EFFORT") or s.effort).strip().lower()
         s.effort = "" if effort in ("", "none", "off", "default") else effort
-        s.thinking = (env.get("THINKING") or s.thinking).strip().lower()
+        s.thinking = _thinking(env.get("THINKING"), s.thinking)
         s.max_tokens = _int(env.get("MAX_TOKENS"), s.max_tokens)
         s.research_tools = _flag(env.get("RESEARCH_TOOLS"), s.research_tools)
         s.max_tool_calls = _int(env.get("MAX_TOOL_CALLS"), s.max_tool_calls)
@@ -118,6 +125,7 @@ class Settings:
         s.judge_model_id = env.get("JUDGE_MODEL_ID") or s.judge_model_id
         judge_effort = (env.get("JUDGE_EFFORT") or s.judge_effort).strip().lower()
         s.judge_effort = "" if judge_effort in ("", "none", "off", "default") else judge_effort
+        s.judge_thinking = _thinking(env.get("JUDGE_THINKING"), s.judge_thinking)
         s.quality_floor = _float(env.get("QUALITY_FLOOR"), s.quality_floor)
         s.quality_target = _float(env.get("QUALITY_TARGET"), s.quality_target)
         s.bake_editions = _int(env.get("BAKE_EDITIONS"), s.bake_editions)

@@ -1,0 +1,29 @@
+{
+  "_comment": "Model profiles. Each infra/params/<env>.json picks one with \"ModelProfile\"; scripts/deploy.py and the eval runner expand it into stack parameters (a key set in the params file wins over the profile). Switching profiles is a release like any other: evals, smoke test and bake. Check access first with: python scripts/deploy.py check-models --env prod --model-profile <name>",
+  "target": {
+    "_comment": "The intended setup: Claude Sonnet 5.5 writes the edition, Claude Haiku 5.5 judges it.",
+    "ModelId": "global.anthropic.claude-sonnet-5-5",
+    "Effort": "medium",
+    "Thinking": "adaptive",
+    "PriceInputMtok": "2",
+    "PriceOutputMtok": "10",
+    "JudgeModelId": "global.anthropic.claude-haiku-5-5",
+    "JudgeEffort": "low",
+    "JudgeThinking": "adaptive",
+    "JudgePriceInputMtok": "1",
+    "JudgePriceOutputMtok": "5"
+  },
+  "haiku-4-5": {
+    "_comment": "Interim setup while the account only has Claude Haiku 4.5: it writes and judges. This model takes no effort parameter and no adaptive thinking. Self-grading is lenient, so read groundedness scores as optimistic.",
+    "ModelId": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "Effort": "none",
+    "Thinking": "off",
+    "PriceInputMtok": "1",
+    "PriceOutputMtok": "5",
+    "JudgeModelId": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "JudgeEffort": "none",
+    "JudgeThinking": "off",
+    "JudgePriceInputMtok": "1",
+    "JudgePriceOutputMtok": "5"
+  }
+}

@@ -5,8 +5,8 @@ A news dashboard for the **20 largest S&P 500 companies**, written by an AI agen
 Three times per trading day (pre-market, midday, after the close) a Lambda function:
 
 1. ranks the S&P 500 top 20 by market cap and collects their prices, company news, SEC filings, market news, earnings dates and RSS headlines,
-2. lets **Claude Sonnet 5.5 on Amazon Bedrock** research (with tools) and write the edition as schema-validated JSON,
-3. validates every citation, then runs the **quality gate**: deterministic checks (figures against market data, advice language) and an **LLM judge** (Claude Haiku 5.5) that scores each section's groundedness against its cited evidence,
+2. lets **Claude on Amazon Bedrock** research (with tools) and write the edition as schema-validated JSON (Claude Sonnet 5.5 in the target setup; see [Models](#models-profiles-access-and-switching-back)),
+3. validates every citation, then runs the **quality gate**: deterministic checks (figures against market data, advice language) and an **LLM judge** (Claude Haiku 5.5 in the target setup) that scores each section's groundedness against its cited evidence,
 4. publishes what passes to a private S3 bucket behind CloudFront (sections that fail are replaced by source headlines), and writes a **run record** that can be replayed as an eval case.
 
 | Section | Content |
@@ -29,8 +29,8 @@ flowchart LR
   A -->|quotes, profiles, news| FH[Finnhub]
   A -->|filings| SEC[SEC EDGAR]
   A -->|headlines| RSS[RSS feeds]
-  A <-->|"research + JSON schema"| W["Claude Sonnet 5.5<br/>(writer)"]
-  A <-->|groundedness verdicts| J["Claude Haiku 5.5<br/>(judge)"]
+  A <-->|"research + JSON schema"| W["Claude writer<br/>(Sonnet 5.5 · interim Haiku 4.5)"]
+  A <-->|groundedness verdicts| J["Claude judge<br/>(Haiku 5.5 · interim Haiku 4.5)"]
   A -->|edition + manifest| S3[("Site bucket<br/>releases/&lt;sha&gt;/ + data/")]
   A -->|run record| OPS[("Ops bucket<br/>runs/ · evals/ · cache/")]
   A -->|EMF metrics| CW["CloudWatch<br/>dashboard + alarms"]
@@ -96,7 +96,7 @@ The demo edition is synthetic placeholder content (headlines start with `[Demo]`
 
 Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM CLI and credentials for your account. The steps use `us-east-1`.
 
-1. **Enable the models on Bedrock (once per account).** In the Bedrock console open **Claude Sonnet 5.5** and **Claude Haiku 5.5** in the playground; the first time, Bedrock asks for Anthropic's use-case form. Send one test prompt to each.
+1. **Check model access.** `python scripts/deploy.py check-models --env prod` sends one tiny request to the models of the environment's model profile and explains any problem (see [Models](#models-profiles-access-and-switching-back)). The repository currently deploys the interim `haiku-4-5` profile.
 2. **Store your Finnhub key** (free at finnhub.io):
    ```powershell
    aws ssm put-parameter --region us-east-1 --type SecureString `
@@ -120,8 +120,8 @@ The first deployment creates the stack directly; every later deployment goes thr
 
 | Parameter | prod | Notes |
 |---|---|---|
-| `ModelId` | `global.anthropic.claude-sonnet-5-5` | Writer model (Bedrock inference profile). |
-| `JudgeModelId` / `JudgeEnabled` | `global.anthropic.claude-haiku-5-5` / `true` | LLM judge used by the quality gate. |
+| `ModelProfile` | `haiku-4-5` | Writer and judge models, effort, thinking and prices from `infra/models.json` (`target` = Sonnet 5.5 + Haiku 5.5). |
+| `JudgeEnabled` | `true` | LLM judge used by the quality gate. |
 | `QualityFloor` / `QualityTarget` | `0.6` / `0.8` | Groundedness under the floor withholds all AI text; under the target the edition is marked degraded. |
 | `BakeEditions` | `3` | Good editions before a release becomes the rollback target (dev: 1). |
 | `SmokeTest` / `AutoRollback` | `ENABLED` | Deployment smoke gate and automatic rollback during the bake. |
@@ -129,7 +129,26 @@ The first deployment creates the stack directly; every later deployment goes thr
 | `ScheduleExpression` | `cron(35 8,12,16 ? * MON-FRI *)` | New York time (dev: once a day after the close). |
 | `DailyCostAlarmUsd`, `MinEvidenceItems` | `3`, `40` | Cost and data-source alarms. |
 
-`AlarmEmail` and `SecUserAgent` come from the `ALARM_EMAIL` / `SEC_USER_AGENT` environment variables (GitHub variables in CI). A change to any parameter is a release like any other: it goes through the eval gate, the smoke test and the bake.
+`AlarmEmail` and `SecUserAgent` come from the `ALARM_EMAIL` / `SEC_USER_AGENT` environment variables (GitHub variables in CI). A change to any parameter is a release like any other: it goes through the eval gate, the smoke test and the bake. `python scripts/deploy.py validate` checks every params file and model profile against the template.
+
+## Models: profiles, access and switching back
+
+`infra/models.json` holds named **model profiles**; each `infra/params/<env>.json` picks one with `"ModelProfile"`. The deploy script, the eval runner (CI) and `check-models` all read the same profile, so what is evaluated is what gets deployed.
+
+| Profile | Writer | Judge | Notes |
+|---|---|---|---|
+| `target` | Claude Sonnet 5.5 (effort medium, adaptive thinking) | Claude Haiku 5.5 | the intended setup |
+| `haiku-4-5` (**active now**) | Claude Haiku 4.5 (no effort parameter, thinking off) | Claude Haiku 4.5 | interim, while the account only has Haiku 4.5; about half the cost; the same model grades its own work, so read groundedness as optimistic |
+
+**Getting access to the other models.** Bedrock enables serverless models automatically: the first call to a model subscribes the account through AWS Marketplace. That first call must come from an identity with `aws-marketplace:Subscribe`, `aws-marketplace:Unsubscribe` and `aws-marketplace:ViewSubscriptions` (an administrator has them), and it can take up to 2 minutes. Anthropic's one-time use-case form applies to older models such as Claude Haiku 4.5, so your account has already done it. To try:
+
+1. Bedrock console (us-east-1) > **Model catalog** > Claude Sonnet 5.5 > **Open in playground**, send one prompt; same for Claude Haiku 5.5. Or run `python scripts/deploy.py check-models --env prod --model-profile target` with administrator credentials.
+2. If it still answers *access denied*, access to that model is restricted for your account; for that case the Bedrock documentation says to contact AWS Sales (or your AWS account team). If it answers *throttling*, ask for a higher tokens-per-minute quota in **Service Quotas**.
+
+**Switching back to `target`** once `check-models --model-profile target` passes:
+
+1. Optional preview of the quality: `cd agent; python -m stocknews.evals --params ../infra/params/prod.json --model-profile target --dataset seed: --gate gate`.
+2. On a branch, set `"ModelProfile": "target"` in `infra/params/dev.json` and `infra/params/prod.json`, open a PR (the evals run with the new models), merge. The release pipeline deploys it through the smoke test and the bake; if it misbehaves, the automatic rollback returns to the Haiku 4.5 release.
 
 ## 3. CI/CD with GitHub Actions
 
@@ -163,7 +182,7 @@ The eval report prints as Markdown (groundedness, validity, unverified figures, 
 
 ## Costs (estimate)
 
-- **Bedrock:** one edition is about 30–60K input tokens (mostly cached) and 8–15K output tokens for the writer, about $0.15–0.30 with Sonnet 5.5 at list price, plus about $0.01–0.03 for the Haiku judge. Three editions per trading day ≈ **$10–20/month** in prod; dev adds about $4/month; each deployment smoke test and eval run costs about the same as one edition per case. Check the Bedrock pricing page for your endpoint. Every run logs and publishes its estimated cost.
+- **Bedrock:** one edition is about 30–60K input tokens (mostly cached) and 8–15K output tokens for the writer, about $0.15–0.30 with Sonnet 5.5 at list price, plus about $0.01–0.03 for the Haiku judge. The interim `haiku-4-5` profile ($1 / $5 per million tokens) costs roughly half. Three editions per trading day ≈ **$10–20/month** in prod; dev adds about $4/month; each deployment smoke test and eval run costs about the same as one edition per case. Check the Bedrock pricing page for your endpoint. Every run logs and publishes its estimated cost.
 - **Lambda, S3, CloudFront, Scheduler, Parameter Store, CodeDeploy:** typically within the free tiers. CloudWatch custom metrics (about 25 per environment) and alarms cost a few dollars a month.
 - **Finnhub:** free plan (about 60 calls/minute); a run makes about 90 calls, plus 40 profile calls once a day.
 

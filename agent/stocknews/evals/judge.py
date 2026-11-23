@@ -188,4 +188,5 @@ def judge_edition(llm: BedrockClaude, analysis: dict, snapshot: MarketSnapshot, 
 
 
 def judge_client(settings) -> BedrockClaude:
-    return BedrockClaude(settings.judge_model_id, settings.bedrock_region, settings.judge_effort, "adaptive", 12000)
+    return BedrockClaude(settings.judge_model_id, settings.bedrock_region, settings.judge_effort,
+                         settings.judge_thinking, 12000)
