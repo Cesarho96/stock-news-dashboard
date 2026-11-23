@@ -1,0 +1,21 @@
+{
+  "_comment": "Parameters for the prod stack (stock-news-dashboard-prod). Changing a model id or the language here is a release like any other: it goes through the eval gate, the smoke test and the bake.",
+  "ModelId": "global.anthropic.claude-sonnet-5-5",
+  "Effort": "medium",
+  "JudgeModelId": "global.anthropic.claude-haiku-5-5",
+  "JudgeEnabled": "true",
+  "QualityFloor": "0.6",
+  "QualityTarget": "0.8",
+  "BakeEditions": "3",
+  "SmokeTest": "ENABLED",
+  "AutoRollback": "ENABLED",
+  "RegenerateAfterRollback": "true",
+  "Language": "en",
+  "ScheduleExpression": "cron(35 8,12,16 ? * MON-FRI *)",
+  "ScheduleTimezone": "America/New_York",
+  "ScheduleState": "ENABLED",
+  "FinnhubKeyParameterName": "/stock-news-dashboard/finnhub-api-key",
+  "DailyCostAlarmUsd": "3",
+  "MinEvidenceItems": "40",
+  "PriceClass": "PriceClass_100"
+}

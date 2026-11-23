@@ -32,16 +32,21 @@ def update_manifest(manifest: dict | None, edition: dict, max_editions: int = 12
         "label": edition.get("timelineLabel", edition["id"]),
         "generatedAt": edition["generatedAt"],
         "status": (edition.get("qa") or {}).get("status", "ok"),
+        "release": (edition.get("qa") or {}).get("release"),
         "demo": bool(edition.get("demo")),
     })
     entries.sort(key=lambda e: e.get("generatedAt", ""), reverse=True)
     entries = entries[:max_editions]
-    return {
+    out = {
         "schemaVersion": 1,
         "latest": entries[0]["id"] if entries else None,
         "updatedAt": edition["generatedAt"],
         "editions": entries,
     }
+    withdrawn = [w for w in manifest.get("withdrawn") or [] if w != edition["id"]]
+    if withdrawn:  # editions an operator removed (scripts/release.py withdraw); a re-run brings one back
+        out["withdrawn"] = withdrawn
+    return out
 
 
 def _dumps(obj: dict) -> bytes:

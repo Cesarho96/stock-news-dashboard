@@ -1,4 +1,7 @@
 # The Lambda itself has no third-party dependencies (stdlib + the boto3 bundled with the runtime).
-# These are only for running the tests and the live mode on your machine.
+# These are for tests, linting, template checks, evals, the deploy/release scripts and live local runs.
 pytest>=8
 boto3>=1.35
+ruff>=0.6
+cfn-lint>=1.0
+aws-sam-translator>=1.90  # SAM transform check in scripts/deploy.py validate (cfn-lint no longer installs it)

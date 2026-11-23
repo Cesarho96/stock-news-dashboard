@@ -25,19 +25,30 @@ def now():
     return NOW
 
 
+# Synthetic market caps (USD millions) for the fake profile endpoint: NFLX ranks outside the top 20.
+CAPS = {
+    "NVDA": 4_450_000, "AAPL": 4_010_000, "MSFT": 3_720_000, "GOOGL": 3_350_000, "AMZN": 2_480_000,
+    "META": 1_620_000, "AVGO": 1_610_000, "TSLA": 1_330_000, "BRK.B": 1_070_000, "LLY": 950_000,
+    "WMT": 860_000, "JPM": 840_000, "ORCL": 700_000, "V": 650_000, "MA": 520_000, "MU": 505_000,
+    "XOM": 480_000, "AMD": 470_000, "JNJ": 455_000, "COST": 430_000, "PLTR": 420_000, "NFLX": 400_000,
+}
+
+
 @pytest.fixture
 def settings():
     s = Settings()
     s.finnhub_min_interval = 0
     s.max_repairs = 2
     s.max_tool_calls = 4
+    s.judge_enabled = False  # tests that need the judge turn it on and script its answer
     return s
 
 
 @pytest.fixture
 def cfg(settings):
     c = load_config(settings)
-    c["watchlist"] = c["watchlist"][:4]  # AAPL, MSFT, NVDA, AVGO
+    keep = ("AAPL", "MSFT", "NVDA", "AVGO", "NFLX")
+    c["watchlist"] = [w for w in c["watchlist"] if w["symbol"] in keep]  # NFLX is the only extra
     return c
 
 
@@ -106,7 +117,9 @@ class FakeFinnhub:
         ]
 
     def profile(self, symbol):
-        return {"name": {"SMCI": "Super Micro Computer"}.get(symbol, symbol)}
+        self.calls.append(("profile", symbol))
+        return {"name": {"SMCI": "Super Micro Computer"}.get(symbol, symbol),
+                "marketCapitalization": CAPS.get(symbol, 100_000)}
 
 
 class FakeHttp:
@@ -171,3 +184,56 @@ def tool_response(*uses):
 @pytest.fixture
 def fake_fh():
     return FakeFinnhub()
+
+
+# ---- analysis builders -------------------------------------------------------------------
+def valid_analysis(snapshot, pool, cfg, mover=None):
+    """A valid edition analysis for any (snapshot, pool): every rule the validator checks holds."""
+    from stocknews.market import coverage
+
+    top20, extras = coverage(cfg, snapshot)
+    news = {s: [e.id for e in pool.by_ticker(s, in_window_only=True)] for s in top20 + extras}
+    with_news = [s for s in top20 if news[s]]
+    lead_sym, alert_sym = with_news[0], with_news[1]
+    mover = mover or with_news[2]
+    used = {news[lead_sym][0], news[alert_sym][0], news[mover][0]}
+    market = [e.id for e in pool.market_wide() if e.in_window and e.id not in used]
+    company = [i for s in top20 + extras for i in news[s][1:2] if i not in used]
+    latest_ids = (market + company)[:4]
+    return {
+        "headline": "The largest companies traded mixed",
+        "summary": "Company news drove the biggest moves among the top twenty.",
+        "top": {
+            "whatHappened": {"title": f"{lead_sym} leads the top twenty", "paragraph": "Shares moved on company news.",
+                             "tickers": [lead_sym], "evidence": news[lead_sym][:1]},
+            "keyAlert": {"category": "alert", "title": f"Update from {alert_sym}", "whatHappened": "The company "
+                         "published an update.", "whyItMatters": "It affects the outlook.", "tickers": [alert_sym],
+                         "evidence": news[alert_sym][:1]},
+            "marketMover": {"ticker": mover, "title": f"{mover} moves on company news",
+                            "whatHappened": "Shares moved after an announcement.", "whyItMatters": "Investors "
+                            "watched the update.", "evidence": news[mover][:1]},
+        },
+        "top20": [{"ticker": s, "sentiment": "neutral",
+                   "note": "Shares moved on company news." if news[s] else "No company-specific news.",
+                   "evidence": news[s][:1]} for s in top20],
+        "latest": [{"theme": "company", "title": f"Story number {i + 1} from the window", "whatHappened": "Something "
+                    "happened.", "whyItMatters": "It matters.", "tickers": [], "evidence": [eid]}
+                   for i, eid in enumerate(latest_ids)],
+        "watchlist": [{"ticker": s, "sentiment": "mixed", "summary": "Quiet session for the stock.",
+                       "whatToWatch": "The next earnings date.", "evidence": news[s][:1]} for s in extras],
+        "sectors": [],
+        "radar": [{"kind": "catalyst", "text": "Earnings season continues next week.", "evidence": []}],
+    }
+
+
+def judge_step(verdict_for=lambda unit_id: "supported", problems_for=lambda unit_id: []):
+    """A ScriptedBedrock step that answers the judge prompt with one verdict per unit."""
+    import re
+
+    def step(body):
+        text = body["messages"][0]["content"][0]["text"]
+        units = re.findall(r"^\[(U\d+)\] (\S+)", text, re.MULTILINE)
+        return text_response({"verdicts": [{"unit": key, "verdict": verdict_for(uid), "problems": problems_for(uid)}
+                                           for key, uid in units]})
+
+    return step

@@ -2,6 +2,11 @@
 
 The browser renderer (web/assets/dashboard.js) only displays what is here: every URL,
 source name, timestamp and price is filled in by this module from collected data.
+
+Edition schema v2: page 01 "Top of the day" holds three cards about the S&P 500 top 20
+and a 20-row board (rank, price, change, market cap, one-line AI note with its source).
+The watchlist page only lists watchlist tickers outside the top 20 and is left out when
+there are none. Pages are numbered in the order they appear.
 """
 
 from __future__ import annotations
@@ -12,12 +17,12 @@ from datetime import date
 from .clock import EditionContext
 from .evidence import Evidence, EvidencePool, trim
 from .i18n import t
-from .market import MarketSnapshot, cls_for, fmt_pct, fmt_price, fmt_range
+from .market import MarketSnapshot, cls_for, coverage, fmt_cap, fmt_pct, fmt_price, fmt_range
 from .schema import THEMES
 from .settings import Settings
 from .validate import cited_ids
 
-SCHEMA_VERSION = 1
+EDITION_SCHEMA_VERSION = 2
 BADGES = {
     "alert": "ncat-r",
     "risk": "ncat-v",
@@ -26,6 +31,7 @@ BADGES = {
     "earnings": "ncat-b",
     "data": "ncat-n",
 }
+MAX_CHIPS = 5
 
 
 def model_label(model_id: str) -> str:
@@ -37,12 +43,19 @@ def model_label(model_id: str) -> str:
     return f"Claude {m.group(1).capitalize()} {version}"
 
 
+# ---- small pieces --------------------------------------------------------------------
+def _source(ctx: EditionContext, ev: Evidence | None) -> dict | None:
+    if ev is None:
+        return None
+    return {"name": ev.source, "url": ev.url, "time": ctx.stamp_label(ev.published), "id": ev.id}
+
+
 def _sources(ctx: EditionContext, pool: EvidencePool, ids: list[str], limit: int = 3) -> list[dict]:
     out = []
     for item_id in ids[:limit]:
-        ev = pool.get(item_id)
-        if ev:
-            out.append({"name": ev.source, "url": ev.url, "time": ctx.stamp_label(ev.published), "id": ev.id})
+        src = _source(ctx, pool.get(item_id))
+        if src:
+            out.append(src)
     return out
 
 
@@ -55,17 +68,28 @@ def _fields(lang: str, what: str, why: str) -> list[dict]:
     return out
 
 
-def _ticker_chip(snapshot: MarketSnapshot, symbol: str) -> dict | None:
+def _price_fields(snapshot: MarketSnapshot, symbol: str) -> dict:
     q = snapshot.quote(symbol)
-    if not q:
-        return None
     return {
-        "symbol": symbol,
-        "name": snapshot.names.get(symbol, symbol),
-        "price": fmt_price(q["price"]),
-        "change": fmt_pct(q["changePct"]),
-        "cls": cls_for(q["changePct"]),
+        "price": fmt_price(q["price"]) if q else "—",
+        "change": fmt_pct(q["changePct"]) if q else "",
+        "cls": cls_for(q["changePct"]) if q else "flat",
     }
+
+
+def _ticker_chip(snapshot: MarketSnapshot, symbol: str) -> dict | None:
+    if not snapshot.quote(symbol):
+        return None
+    return {"symbol": symbol, "name": snapshot.names.get(symbol, symbol), **_price_fields(snapshot, symbol)}
+
+
+def _chips(snapshot: MarketSnapshot, tickers: list[str], top20: list[str]) -> list[dict]:
+    """Small 'NVDA ▲ 1.2%' chips for the top-20 companies a card is about."""
+    out = []
+    for sym in tickers:
+        if sym in top20 and snapshot.quote(sym) and len(out) < MAX_CHIPS:
+            out.append({"symbol": sym, **_price_fields(snapshot, sym)})
+    return out
 
 
 def _story(ctx: EditionContext, pool: EvidencePool, item: dict) -> dict:
@@ -84,7 +108,7 @@ def _evidence_story(ctx: EditionContext, ev: Evidence) -> dict:
         "title": ev.title,
         "fields": [{"label": t(ctx.language, "field.summary"), "text": ev.summary}] if ev.summary else [],
         "tickers": ev.tickers,
-        "sources": [{"name": ev.source, "url": ev.url, "time": ctx.stamp_label(ev.published), "id": ev.id}],
+        "sources": [_source(ctx, ev)],
         "inWindow": ev.in_window,
     }
 
@@ -123,11 +147,21 @@ def _earnings_label(ctx: EditionContext, rows: list[dict], symbol: str) -> str |
     return None
 
 
+def _top20_headlines(pool: EvidencePool, top20: list[str]) -> list[Evidence]:
+    """In-window items about top-20 companies; broad market/RSS stories before company feeds."""
+    wanted = set(top20)
+    items = [e for e in pool.items.values() if e.in_window and wanted.intersection(e.tickers)]
+    broad = [e for e in items if e.origin == "market" or e.origin.startswith("rss:")]
+    rest = [e for e in items if e not in broad]
+    return (sorted(broad, key=lambda e: e.published, reverse=True)
+            + sorted(rest, key=lambda e: e.published, reverse=True))
+
+
 # ---- shared sections ----------------------------------------------------------------
 def _base(ctx: EditionContext, cfg: dict, demo: bool = False) -> dict:
     lang = ctx.language
     return {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": EDITION_SCHEMA_VERSION,
         "id": ctx.edition_id,
         "date": ctx.date,
         "slot": ctx.slot,
@@ -145,33 +179,182 @@ def _base(ctx: EditionContext, cfg: dict, demo: bool = False) -> dict:
 def _strip(ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot) -> dict:
     tiles = []
     for s in cfg.get("strip", []):
-        q = snapshot.quote(s["symbol"])
-        tiles.append({
-            "name": s["name"],
-            "mini": s["symbol"],
-            "value": fmt_price(q["price"]) if q else "—",
-            "change": fmt_pct(q["changePct"]) if q else "",
-            "cls": cls_for(q["changePct"]) if q else "flat",
-        })
+        px = _price_fields(snapshot, s["symbol"])
+        tiles.append({"name": s["name"], "mini": s["symbol"], "value": px["price"], "change": px["change"],
+                      "cls": px["cls"]})
     as_of = snapshot.as_of()
     meta = (t(ctx.language, "strip.meta", asof=ctx.stamp_label(as_of)) if as_of
             else t(ctx.language, "strip.metaNoTime"))
     return {"meta": meta, "tiles": tiles}
 
 
-def _markets_page(ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot) -> dict:
+def _top_cards(ctx: EditionContext, snapshot: MarketSnapshot, pool: EvidencePool, top: dict,
+               top20: list[str]) -> list[dict]:
+    """The three 'Top of the day' cards. Any card the model did not deliver (or that the
+    quality gate withheld) is replaced by a headline card about the top 20."""
     lang = ctx.language
+    lead, alert, mover = top.get("whatHappened") or {}, top.get("keyAlert") or {}, top.get("marketMover") or {}
+    fallback = _fallback_top(ctx, snapshot, pool, top20)
+    cards = []
+    if lead.get("evidence") and lead.get("paragraph"):
+        cards.append({"slot": "lead", "kicker": t(lang, "kicker.lead"), "badge": None, "title": lead["title"],
+                      "paragraph": lead["paragraph"], "fields": [], "ticker": None,
+                      "chips": _chips(snapshot, lead.get("tickers") or [], top20),
+                      "sources": _sources(ctx, pool, lead["evidence"])})
+    else:
+        cards.append(fallback[0])
+    if alert.get("evidence") and alert.get("whatHappened"):
+        cat = alert.get("category") or "alert"
+        cards.append({"slot": "alert", "kicker": t(lang, "kicker.alert"),
+                      "badge": {"text": t(lang, f"badge.{cat}"), "cls": BADGES.get(cat, "ncat-r")},
+                      "title": alert["title"], "paragraph": None,
+                      "fields": _fields(lang, alert["whatHappened"], alert.get("whyItMatters", "")),
+                      "ticker": None, "chips": _chips(snapshot, alert.get("tickers") or [], top20),
+                      "sources": _sources(ctx, pool, alert["evidence"])})
+    else:
+        cards.append(fallback[1])
+    sym = mover.get("ticker") or ""
+    chip = _ticker_chip(snapshot, sym) if sym in top20 else None
+    if chip and mover.get("evidence") and mover.get("whatHappened"):
+        cards.append({"slot": "mover", "kicker": t(lang, "kicker.mover"), "badge": None,
+                      "title": mover["title"], "paragraph": None,
+                      "fields": _fields(lang, mover["whatHappened"], mover.get("whyItMatters", "")),
+                      "ticker": chip, "chips": [], "sources": _sources(ctx, pool, mover["evidence"])})
+    else:
+        cards.append(fallback[2])
+    return cards
+
+
+def _fallback_top(ctx: EditionContext, snapshot: MarketSnapshot, pool: EvidencePool,
+                  top20: list[str]) -> list[dict]:
+    """Headline-only cards, still limited to top-20 companies."""
+    lang = ctx.language
+    best = None
+    for sym in top20:
+        q = snapshot.quote(sym)
+        if q and (best is None or abs(q["changePct"]) > abs(best[1]["changePct"])):
+            best = (sym, q)
+    mover_news = pool.by_ticker(best[0], in_window_only=True) if best else []
+    mover_ev = mover_news[0] if mover_news else None
+    headlines = [e for e in _top20_headlines(pool, top20) if e is not mover_ev]
+    lead_ev = headlines[0] if headlines else None
+    alert_ev = headlines[1] if len(headlines) > 1 else None
+    empty = t(lang, "fallback.noTop")
+    lead = {"slot": "lead", "kicker": t(lang, "kicker.lead"), "badge": None,
+            "title": lead_ev.title if lead_ev else empty,
+            "paragraph": (lead_ev.summary or None) if lead_ev else None, "fields": [], "ticker": None,
+            "chips": _chips(snapshot, lead_ev.tickers, top20) if lead_ev else [],
+            "sources": [_source(ctx, lead_ev)] if lead_ev else []}
+    alert = {"slot": "alert", "kicker": t(lang, "kicker.alert"), "badge": None,
+             "title": alert_ev.title if alert_ev else empty, "paragraph": None,
+             "fields": ([{"label": t(lang, "field.summary"), "text": alert_ev.summary}]
+                        if alert_ev and alert_ev.summary else []),
+             "ticker": None, "chips": _chips(snapshot, alert_ev.tickers, top20) if alert_ev else [],
+             "sources": [_source(ctx, alert_ev)] if alert_ev else []}
+    if best:
+        sym = best[0]
+        mover = {"slot": "mover", "kicker": t(lang, "kicker.mover"), "badge": None,
+                 "title": mover_ev.title if mover_ev else f"{snapshot.names.get(sym, sym)} ({sym})",
+                 "paragraph": None,
+                 "fields": [{"label": t(lang, "field.summary"),
+                             "text": (mover_ev.summary if mover_ev and mover_ev.summary
+                                      else t(lang, "fallback.mover"))}],
+                 "ticker": _ticker_chip(snapshot, sym), "chips": [],
+                 "sources": [_source(ctx, mover_ev)] if mover_ev else []}
+    else:
+        mover = {"slot": "mover", "kicker": t(lang, "kicker.mover"), "badge": None, "title": empty,
+                 "paragraph": None, "fields": [], "ticker": None, "chips": [], "sources": []}
+    return [lead, alert, mover]
+
+
+def _board(ctx: EditionContext, snapshot: MarketSnapshot, pool: EvidencePool, notes: list | None,
+           earnings: list[dict], used: list[str]) -> dict:
+    """The top-20 table. Rows without a validated AI note show the latest source headline."""
+    lang = ctx.language
+    by_symbol = {n["ticker"]: n for n in notes or [] if isinstance(n, dict) and n.get("ticker")}
+    rows = []
+    for row in snapshot.universe:
+        sym = row["symbol"]
+        note = by_symbol.get(sym)
+        sentiment, label = None, None
+        if note and note.get("note"):
+            kind, text = "ai", note["note"]
+            key = note.get("sentiment") or "neutral"
+            sentiment = {"key": key, "label": t(lang, f"sent.{key}")}
+            ev = next((pool.get(i) for i in note.get("evidence") or [] if pool.get(i)), None)
+        else:
+            news = pool.by_ticker(sym, in_window_only=True)
+            ev = news[0] if news else None
+            if ev:
+                kind, text, label = "headline", ev.title, t(lang, "board.headline")
+            else:
+                kind, text = "none", t(lang, "board.noNews")
+        if ev:
+            used.append(ev.id)
+        rows.append({
+            "rank": row["rank"],
+            "symbol": sym,
+            "name": row.get("name") or snapshot.names.get(sym, sym),
+            **_price_fields(snapshot, sym),
+            "marketCap": fmt_cap(row.get("marketCap")),
+            "sentiment": sentiment,
+            "note": text,
+            "noteKind": kind,
+            "noteLabel": label,
+            "source": _source(ctx, ev),
+            "earnings": _earnings_label(ctx, earnings, sym),
+        })
+    return {
+        "title": t(lang, "board.title"),
+        "note": t(lang, "board.note"),
+        "columns": {k: t(lang, f"board.col.{k}") for k in ("rank", "company", "price", "change", "cap", "note")},
+        "rows": rows,
+    }
+
+
+def _watchlist_cards(ctx: EditionContext, snapshot: MarketSnapshot, pool: EvidencePool, extras: list[str],
+                     notes: list | None, earnings: list[dict], fallback: bool, used: list[str]) -> list[dict]:
+    lang = ctx.language
+    by_symbol = {n["ticker"]: n for n in notes or [] if isinstance(n, dict) and n.get("ticker")}
+    cards = []
+    for sym in extras:
+        note = by_symbol.get(sym)
+        cited = [pool.get(i) for i in (note or {}).get("evidence") or [] if pool.get(i)]
+        headlines: list[Evidence] = []
+        for ev in cited + pool.by_ticker(sym, in_window_only=True):
+            if ev not in headlines:
+                headlines.append(ev)
+        headlines = headlines[:3]
+        used.extend(e.id for e in headlines)
+        cards.append({
+            "symbol": sym,
+            "name": snapshot.names.get(sym, sym),
+            **_price_fields(snapshot, sym),
+            "sentiment": ({"key": note["sentiment"], "label": t(lang, f"sent.{note['sentiment']}")}
+                          if note else None),
+            "summary": note["summary"] if note else t(lang, "watch.noAi" if fallback else "watch.noNote"),
+            "watch": ({"label": t(lang, "field.watch"), "text": note["whatToWatch"]}
+                      if note and note.get("whatToWatch") else None),
+            "earnings": _earnings_label(ctx, earnings, sym),
+            "headlines": [{"title": e.title, "name": e.source, "url": e.url,
+                           "time": ctx.stamp_label(e.published)} for e in headlines],
+        })
+    return cards
+
+
+def _markets_page(ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot, symbols: list[str],
+                  earnings: list[dict]) -> dict:
+    lang = ctx.language
+    moves = [(snapshot.quote(s)["changePct"], s) for s in symbols if snapshot.quote(s)]
+    up = sorted((m for m in moves if m[0] > 0), reverse=True)[:3]
+    down = sorted(m for m in moves if m[0] < 0)[:3]
     movers = []
-    for w in cfg["watchlist"]:
-        q = snapshot.quote(w["symbol"])
-        if not q:
-            continue
-        movers.append((q["changePct"], {
-            "symbol": w["symbol"],
-            "name": snapshot.names.get(w["symbol"], w["symbol"]),
-            "price": fmt_price(q["price"]),
-            "change": fmt_pct(q["changePct"]),
-            "cls": cls_for(q["changePct"]),
+    for _, sym in up + sorted(down, reverse=True):  # best to worst
+        q = snapshot.quote(sym)
+        movers.append({
+            "symbol": sym,
+            "name": snapshot.names.get(sym, sym),
+            **_price_fields(snapshot, sym),
             "metrics": [
                 {"label": t(lang, "metric.change"),
                  "value": f"{'+' if q['change'] >= 0 else '−'}{fmt_price(abs(q['change']))}",
@@ -179,20 +362,14 @@ def _markets_page(ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot) -> d
                 {"label": t(lang, "metric.range"), "value": fmt_range(q.get("low"), q.get("high"))},
                 {"label": t(lang, "metric.prev"), "value": fmt_price(q.get("prevClose"))},
             ],
-        }))
-    movers.sort(key=lambda m: m[0], reverse=True)
+        })
     tiles = []
     for s in cfg.get("sectors", []):
-        q = snapshot.quote(s["etf"])
-        tiles.append({
-            "name": (s.get("label") or {}).get(lang) or s["id"],
-            "mini": s["etf"],
-            "value": fmt_price(q["price"]) if q else "—",
-            "change": fmt_pct(q["changePct"]) if q else "",
-            "cls": cls_for(q["changePct"]) if q else "flat",
-        })
+        px = _price_fields(snapshot, s["etf"])
+        tiles.append({"name": (s.get("label") or {}).get(lang) or s["id"], "mini": s["etf"],
+                      "value": px["price"], "change": px["change"], "cls": px["cls"]})
     agenda = []
-    for r in _earnings_rows(ctx, snapshot):
+    for r in earnings:
         when = ctx.date_label(r["date"]) + (f" · {r['hour']}" if r["hour"] else "")
         parts = [f"{r['symbol']} ({snapshot.names.get(r['symbol'], r['symbol'])})"]
         if r["eps"] is not None:
@@ -201,8 +378,8 @@ def _markets_page(ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot) -> d
             parts.append(f"revenue est. {_money(r['revenue'])}")
         agenda.append({"when": when, "text": " · ".join(parts)})
     return {
-        "type": "markets", "number": "04", "title": t(lang, "page.markets"),
-        "movers": {"title": t(lang, "movers.title"), "items": [m[1] for m in movers]},
+        "type": "markets", "title": t(lang, "page.markets"),
+        "movers": {"title": t(lang, "movers.title"), "items": movers},
         "secondary": {"summary": t(lang, "secondary.summary"), "tiles": tiles, "note": t(lang, "secondary.note")},
         "agenda": {"title": t(lang, "agenda.title"), "items": agenda, "empty": t(lang, "agenda.empty")},
     }
@@ -242,197 +419,124 @@ def _method_lines(ctx: EditionContext, cfg: dict, pool: EvidencePool, settings: 
     lang = ctx.language
     since = ctx.stamp_label(ctx.window_start_utc)
     lines = [t(lang, "method.collect", n=len(pool), s=len(pool.sources()), since=since,
-               days=(cfg.get("limits") or {}).get("contextDays", 7))]
-    if qa.get("status") == "fallback":
+               days=(cfg.get("limits") or {}).get("contextDays", 7)),
+             t(lang, "method.top20", n=len((cfg.get("universe") or {}).get("pool") or []))]
+    if qa.get("status") == "fallback" and (qa.get("quality") or {}).get("gate") == "withhold":
+        reason = str(qa.get("reason", "")).removeprefix("quality gate: ")
+        lines.append(t(lang, "method.withheldAll", reason=reason))
+    elif qa.get("status") == "fallback":
         lines.append(t(lang, "method.fallback", reason=qa.get("reason", "error")))
     elif qa.get("status") != "demo":
         tools = t(lang, "method.tools", n=qa["toolCalls"]) if qa.get("toolCalls") else ""
         repairs = t(lang, "method.repairs", n=qa["repairs"]) if qa.get("repairs") else ""
         lines.append(t(lang, "method.agent", model=model_label(settings.model_id), tools=tools, repairs=repairs))
+        quality = qa.get("quality") or {}
+        if quality.get("groundedness") is not None:
+            lines.append(t(lang, "method.quality", score=f"{quality['groundedness']:.2f}",
+                           judge=model_label(quality.get("judgeModel", "")),
+                           unverified=quality.get("unverifiedNumbers", 0), fixes=qa.get("fixes", 0)))
+        elif quality:
+            lines.append(t(lang, "method.qualityNoJudge", unverified=quality.get("unverifiedNumbers", 0),
+                           fixes=qa.get("fixes", 0)))
+        if quality.get("withheld"):
+            lines.append(t(lang, "method.withheld", n=len(quality["withheld"])))
     lines.append(t(lang, "method.data"))
     return lines
 
 
-# ---- full edition (AI analysis) ----------------------------------------------------------
-def compose_edition(ctx: EditionContext, cfg: dict, settings: Settings, snapshot: MarketSnapshot,
-                    pool: EvidencePool, analysis: dict, qa: dict, demo: bool = False) -> dict:
+# ---- editions --------------------------------------------------------------------------
+def _compose(ctx: EditionContext, cfg: dict, settings: Settings, snapshot: MarketSnapshot, pool: EvidencePool,
+             analysis: dict, qa: dict, demo: bool, fallback: bool) -> dict:
     lang = ctx.language
     edition = _base(ctx, cfg, demo=demo)
-    top = analysis.get("top") or {}
-    lead, alert, mover = top.get("whatHappened") or {}, top.get("keyAlert") or {}, top.get("marketMover") or {}
-    fallback_top = _fallback_top(ctx, cfg, snapshot, pool)
-
-    cards = []
-    if lead.get("evidence") and lead.get("paragraph"):
-        cards.append({"slot": "lead", "kicker": t(lang, "kicker.lead"), "badge": None, "title": lead["title"],
-                      "paragraph": lead["paragraph"], "fields": [], "ticker": None,
-                      "sources": _sources(ctx, pool, lead["evidence"])})
-    else:
-        cards.append(fallback_top[0])
-    if alert.get("evidence") and alert.get("whatHappened"):
-        cat = alert.get("category") or "alert"
-        cards.append({"slot": "alert", "kicker": t(lang, "kicker.alert"),
-                      "badge": {"text": t(lang, f"badge.{cat}"), "cls": BADGES.get(cat, "ncat-r")},
-                      "title": alert["title"], "paragraph": None,
-                      "fields": _fields(lang, alert["whatHappened"], alert.get("whyItMatters", "")),
-                      "ticker": None, "sources": _sources(ctx, pool, alert["evidence"])})
-    else:
-        cards.append(fallback_top[1])
-    chip = _ticker_chip(snapshot, mover.get("ticker", "")) if mover.get("ticker") else None
-    if chip and mover.get("evidence") and mover.get("whatHappened"):
-        cards.append({"slot": "mover", "kicker": t(lang, "kicker.mover"), "badge": None,
-                      "title": mover["title"], "paragraph": None,
-                      "fields": _fields(lang, mover["whatHappened"], mover.get("whyItMatters", "")),
-                      "ticker": chip, "sources": _sources(ctx, pool, mover["evidence"])})
-    else:
-        cards.append(fallback_top[2])
-
-    # latest, grouped by theme in order of first appearance
-    blocks: dict[str, dict] = {}
-    for item in analysis.get("latest") or []:
-        theme = item.get("theme") if item.get("theme") in THEMES else "company"
-        block = blocks.setdefault(theme, {"id": theme, "title": t(lang, f"theme.{theme}"), "stories": []})
-        block["stories"].append(_story(ctx, pool, item))
-    n_latest = len(analysis.get("latest") or [])
-
-    # watchlist
-    notes = {n["ticker"]: n for n in analysis.get("watchlist") or [] if isinstance(n, dict) and n.get("ticker")}
+    top20, extras = coverage(cfg, snapshot)
     earnings = _earnings_rows(ctx, snapshot)
-    extra_ids: list[str] = []
-    wl_cards = []
-    for w in cfg["watchlist"]:
-        sym = w["symbol"]
-        note = notes.get(sym)
-        cited = [pool.get(i) for i in (note or {}).get("evidence") or [] if pool.get(i)]
-        recent = pool.by_ticker(sym, in_window_only=True)
-        headlines: list[Evidence] = []
-        for ev in cited + recent:
-            if ev not in headlines:
-                headlines.append(ev)
-        headlines = headlines[:3]
-        extra_ids += [e.id for e in headlines]
-        q = snapshot.quote(sym)
-        wl_cards.append({
-            "symbol": sym,
-            "name": snapshot.names.get(sym, w.get("name") or sym),
-            "price": fmt_price(q["price"]) if q else "—",
-            "change": fmt_pct(q["changePct"]) if q else "",
-            "cls": cls_for(q["changePct"]) if q else "flat",
-            "sentiment": ({"key": note["sentiment"], "label": t(lang, f"sent.{note['sentiment']}")}
-                          if note else None),
-            "summary": note["summary"] if note else (t(lang, "watch.noAi") if qa.get("status") == "fallback"
-                                                     else t(lang, "watch.noNote")),
-            "watch": ({"label": t(lang, "field.watch"), "text": note["whatToWatch"]}
-                      if note and note.get("whatToWatch") else None),
-            "earnings": _earnings_label(ctx, earnings, sym),
-            "headlines": [{"title": e.title, "name": e.source, "url": e.url,
-                           "time": ctx.stamp_label(e.published)} for e in headlines],
-        })
+    used: list[str] = []
 
-    # sectors
-    by_sector: dict[str, list] = {}
-    for item in analysis.get("sectors") or []:
-        by_sector.setdefault(item["sector"], []).append(_story(ctx, pool, item))
+    cards = _top_cards(ctx, snapshot, pool, {} if fallback else (analysis.get("top") or {}), top20)
+    board = _board(ctx, snapshot, pool, None if fallback else analysis.get("top20"), earnings, used)
 
-    # radar
-    signals = [{"kind": r["kind"], "label": t(lang, f"signal.{r['kind']}"), "text": r["text"],
-                "sources": _sources(ctx, pool, r.get("evidence") or [], 2)}
-               for r in analysis.get("radar") or []]
+    if fallback:
+        shown = {s["id"] for c in cards for s in c["sources"]}
+        headlines = [e for e in pool.market_wide() if e.in_window and e.id not in shown][:10]
+        stories = [_evidence_story(ctx, e) for e in headlines]
+        used += [e.id for e in headlines]
+        blocks = [{"id": "headlines", "title": t(lang, "theme.headlines"), "stories": stories}] if stories else []
+        n_latest = len(stories)
+        by_sector: dict[str, list] = {}
+        signals = [{"kind": "data", "label": t(lang, "signal.data"),
+                    "text": f"{r['symbol']} · {t(lang, 'earnings.label')}: {ctx.date_label(r['date'])}"
+                            + (f" · {r['hour']}" if r["hour"] else ""), "sources": []} for r in earnings[:6]]
+    else:
+        # latest, grouped by theme in order of first appearance
+        grouped: dict[str, dict] = {}
+        for item in analysis.get("latest") or []:
+            theme = item.get("theme") if item.get("theme") in THEMES else "company"
+            block = grouped.setdefault(theme, {"id": theme, "title": t(lang, f"theme.{theme}"), "stories": []})
+            block["stories"].append(_story(ctx, pool, item))
+        blocks = list(grouped.values())
+        n_latest = len(analysis.get("latest") or [])
+        by_sector = {}
+        for item in analysis.get("sectors") or []:
+            by_sector.setdefault(item["sector"], []).append(_story(ctx, pool, item))
+        signals = [{"kind": r["kind"], "label": t(lang, f"signal.{r['kind']}"), "text": r["text"],
+                    "sources": _sources(ctx, pool, r.get("evidence") or [], 2)}
+                   for r in analysis.get("radar") or []]
+        used += cited_ids(analysis)
 
-    edition["intro"] = {
-        "greeting": t(lang, f"greeting.{ctx.slot}"),
-        "headline": analysis.get("headline", ""),
-        "body": analysis.get("summary", ""),
-        "stamp": t(lang, "stamp", since=ctx.stamp_label(ctx.window_start_utc).upper(), n=len(pool),
-                   s=len(pool.sources()), model=model_label(settings.model_id).upper()),
-    }
+    if fallback:
+        edition["intro"] = {
+            "greeting": t(lang, f"greeting.{ctx.slot}"),
+            "headline": t(lang, "fallback.headline"),
+            "body": t(lang, "fallback.body"),
+            "stamp": t(lang, "stamp.fallback", since=ctx.stamp_label(ctx.window_start_utc).upper(), n=len(pool),
+                       s=len(pool.sources())),
+        }
+    else:
+        edition["intro"] = {
+            "greeting": t(lang, f"greeting.{ctx.slot}"),
+            "headline": analysis.get("headline", ""),
+            "body": analysis.get("summary", ""),
+            "stamp": t(lang, "stamp", since=ctx.stamp_label(ctx.window_start_utc).upper(), n=len(pool),
+                       s=len(pool.sources()), model=model_label(settings.model_id).upper()),
+        }
     edition["strip"] = _strip(ctx, cfg, snapshot)
-    edition["pages"] = [
-        {"type": "top", "number": "01", "title": t(lang, "page.top"), "cards": cards},
-        {"type": "latest", "number": "02", "title": t(lang, "page.latest"),
+    pages = [
+        {"type": "top", "title": t(lang, "page.top"), "cards": cards, "board": board},
+        {"type": "latest", "title": t(lang, "page.latest"),
          "countLabel": t(lang, "story") if n_latest == 1 else t(lang, "stories", n=n_latest),
-         "blocks": list(blocks.values()), "empty": t(lang, "latest.empty")},
-        {"type": "watchlist", "number": "03", "title": t(lang, "page.watchlist"), "cards": wl_cards},
-        _markets_page(ctx, cfg, snapshot),
-        {"type": "sectors", "number": "05", "title": t(lang, "page.sectors"),
-         "tabs": _sector_tabs(ctx, cfg, snapshot, by_sector)},
-        {"type": "radar", "number": "06", "title": t(lang, "page.radar"), "signals": signals,
+         "blocks": blocks, "empty": t(lang, "latest.empty")},
+    ]
+    if extras:
+        pages.append({"type": "watchlist", "title": t(lang, "page.watchlist"),
+                      "cards": _watchlist_cards(ctx, snapshot, pool, extras,
+                                                None if fallback else analysis.get("watchlist"),
+                                                earnings, fallback, used)})
+    pages += [
+        _markets_page(ctx, cfg, snapshot, top20 + extras, earnings),
+        {"type": "sectors", "title": t(lang, "page.sectors"), "tabs": _sector_tabs(ctx, cfg, snapshot, by_sector)},
+        {"type": "radar", "title": t(lang, "page.radar"), "signals": signals,
          "method": {"title": t(lang, "method.title"), "lines": _method_lines(ctx, cfg, pool, settings, qa)}},
     ]
-    used = cited_ids(analysis) + extra_ids + [s["id"] for c in cards for s in c["sources"]]
+    for number, page in enumerate(pages, 1):
+        page["number"] = f"{number:02d}"
+    edition["pages"] = pages
+    used += [s["id"] for c in cards for s in c["sources"]]
     edition["footer"] = _footer(ctx, pool, used)
     edition["qa"] = qa
     return edition
 
 
-# ---- fallback edition (no AI) -----------------------------------------------------------
-def _fallback_top(ctx: EditionContext, cfg: dict, snapshot: MarketSnapshot, pool: EvidencePool) -> list[dict]:
-    lang = ctx.language
-    market = [e for e in pool.market_wide() if e.in_window] or pool.market_wide()
-    lead_ev = market[0] if market else None
-    alert_ev = market[1] if len(market) > 1 else None
-    lead = {"slot": "lead", "kicker": t(lang, "kicker.lead"), "badge": None,
-            "title": lead_ev.title if lead_ev else t(lang, "latest.empty"),
-            "paragraph": (lead_ev.summary or None) if lead_ev else None, "fields": [], "ticker": None,
-            "sources": _sources(ctx, pool, [lead_ev.id]) if lead_ev else []}
-    alert = {"slot": "alert", "kicker": t(lang, "kicker.alert"), "badge": None,
-             "title": alert_ev.title if alert_ev else t(lang, "latest.empty"), "paragraph": None,
-             "fields": ([{"label": t(lang, "field.summary"), "text": alert_ev.summary}]
-                        if alert_ev and alert_ev.summary else []),
-             "ticker": None, "sources": _sources(ctx, pool, [alert_ev.id]) if alert_ev else []}
-    best = None
-    for w in cfg["watchlist"]:
-        q = snapshot.quote(w["symbol"])
-        if q and (best is None or abs(q["changePct"]) > abs(best[1]["changePct"])):
-            best = (w["symbol"], q)
-    if best:
-        sym = best[0]
-        news = pool.by_ticker(sym, in_window_only=True)
-        mover = {"slot": "mover", "kicker": t(lang, "kicker.mover"), "badge": None,
-                 "title": news[0].title if news else f"{snapshot.names.get(sym, sym)} ({sym})",
-                 "paragraph": None,
-                 "fields": [{"label": t(lang, "field.summary"),
-                             "text": (news[0].summary if news and news[0].summary else t(lang, "fallback.mover"))}],
-                 "ticker": _ticker_chip(snapshot, sym),
-                 "sources": _sources(ctx, pool, [news[0].id]) if news else []}
-    else:
-        mover = {"slot": "mover", "kicker": t(lang, "kicker.mover"), "badge": None,
-                 "title": t(lang, "latest.empty"), "paragraph": None, "fields": [], "ticker": None, "sources": []}
-    return [lead, alert, mover]
+def compose_edition(ctx: EditionContext, cfg: dict, settings: Settings, snapshot: MarketSnapshot,
+                    pool: EvidencePool, analysis: dict, qa: dict, demo: bool = False) -> dict:
+    """Full edition from the model's validated analysis."""
+    return _compose(ctx, cfg, settings, snapshot, pool, analysis, qa, demo=demo, fallback=False)
 
 
 def compose_fallback(ctx: EditionContext, cfg: dict, settings: Settings, snapshot: MarketSnapshot,
                      pool: EvidencePool, qa: dict) -> dict:
-    """Market data + source headlines, no AI text. Used when the AI step fails."""
-    lang = ctx.language
-    headlines = [e for e in pool.market_wide() if e.in_window][:10]
-    cards = _fallback_top(ctx, cfg, snapshot, pool)
-    used_top = {s["id"] for c in cards for s in c["sources"]}
-    stories = [_evidence_story(ctx, e) for e in headlines if e.id not in used_top]
-    earnings = _earnings_rows(ctx, snapshot)
-    signals = [{"kind": "data", "label": t(lang, "signal.data"),
-                "text": f"{r['symbol']} · {t(lang, 'earnings.label')}: {ctx.date_label(r['date'])}"
-                        + (f" · {r['hour']}" if r["hour"] else ""), "sources": []} for r in earnings[:6]]
-    analysis = {"headline": t(lang, "fallback.headline"), "summary": t(lang, "fallback.body"),
-                "latest": [], "watchlist": [], "sectors": [], "radar": []}
-    edition = compose_edition(ctx, cfg, settings, snapshot, pool, analysis, qa)
-    edition["intro"]["stamp"] = t(lang, "stamp.fallback", since=ctx.stamp_label(ctx.window_start_utc).upper(),
-                                  n=len(pool), s=len(pool.sources()))
-    for page in edition["pages"]:
-        if page["type"] == "latest":
-            page["blocks"] = ([{"id": "headlines", "title": t(lang, "theme.headlines"), "stories": stories}]
-                              if stories else [])
-            page["countLabel"] = t(lang, "story") if len(stories) == 1 else t(lang, "stories", n=len(stories))
-        elif page["type"] == "radar":
-            page["signals"] = signals
-    used = [s["id"] for c in cards for s in c["sources"]] + [e.id for e in headlines]
-    for card in edition["pages"][2]["cards"]:
-        for h in card["headlines"]:
-            match = next((e for e in pool.items.values() if e.url == h["url"]), None)
-            if match:
-                used.append(match.id)
-    edition["footer"] = _footer(ctx, pool, used)
-    return edition
+    """Market data + source headlines, no AI text. Used when the AI step fails or is withheld."""
+    return _compose(ctx, cfg, settings, snapshot, pool, {}, qa, demo=False, fallback=True)
 
 
 def short_reason(exc: BaseException) -> str:

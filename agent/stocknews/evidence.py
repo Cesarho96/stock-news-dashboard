@@ -196,6 +196,46 @@ class EvidencePool:
             self._admit(c)
         self._candidates.clear()
 
+    # ---- serialization (run records, eval datasets) -----------------------------------
+    def to_dict(self) -> dict:
+        return {
+            "now": self.now.isoformat(),
+            "windowStart": self.window_start.isoformat(),
+            "contextStart": self.context_start.isoformat(),
+            "summaryChars": self.summary_chars,
+            "items": [
+                {"id": e.id, "kind": e.kind, "title": e.title, "summary": e.summary, "source": e.source,
+                 "url": e.url, "published": e.published.isoformat(), "tickers": e.tickers,
+                 "origin": e.origin, "inWindow": e.in_window}
+                for e in self.items.values()
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EvidencePool":
+        def ts(value: str) -> datetime:
+            dt = datetime.fromisoformat(value)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        pool = cls(ts(data["now"]), ts(data["windowStart"]), ts(data["contextStart"]),
+                   int(data.get("summaryChars") or 280))
+        pool.finalized = True
+        top = 0
+        for it in data.get("items") or []:
+            ev = Evidence(id=it["id"], kind=it.get("kind", "news"), title=it["title"],
+                          summary=it.get("summary", ""), source=it.get("source", ""), url=it["url"],
+                          published=ts(it["published"]), tickers=list(it.get("tickers") or []),
+                          origin=it.get("origin", "market"), in_window=bool(it.get("inWindow", True)))
+            pool.items[ev.id] = ev
+            pool._keys[f"u:{url_key(ev.url)}"] = ev.id
+            pool._keys[f"t:{title_key(ev.title)}"] = ev.id
+            try:
+                top = max(top, int(ev.id[1:]))
+            except ValueError:
+                pass
+        pool._next = top + 1
+        return pool
+
     # ---- queries -------------------------------------------------------------------
     def __contains__(self, item_id: str) -> bool:
         return item_id in self.items

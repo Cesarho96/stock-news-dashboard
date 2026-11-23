@@ -1,0 +1,419 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time account setup for the AI stock news dashboard: GitHub OIDC roles for CI/CD (no
+  long-lived AWS keys), a CloudFormation execution role scoped to the app's resources, the
+  artifacts bucket (one immutable package per release), the ops bucket (run records, eval
+  datasets and reports, caches) and a monthly budget alert.
+  Deploy with: python scripts/deploy.py bootstrap --github-repo OWNER/REPO --email you@example.com
+
+Parameters:
+  AppName:
+    Type: String
+    Default: stock-news-dashboard
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  GitHubRepository:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    Description: OWNER/REPO whose workflows may assume the CI roles.
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false if the account already has the token.actions.githubusercontent.com provider.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 30
+  BudgetEmail:
+    Type: String
+    Default: ""
+  RunRecordRetentionDays:
+    Type: Number
+    Default: 400
+    Description: How long run records (replayable inputs and outputs of every edition) are kept.
+
+Conditions:
+  CreateOidc: !Equals [!Ref CreateOidcProvider, "true"]
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ---------------------------------------------------------------- buckets
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-releases
+            Status: Enabled
+            Prefix: releases/
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  OpsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-run-records
+            Status: Enabled
+            Prefix: runs/
+            ExpirationInDays: !Ref RunRecordRetentionDays
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactsBucket.Arn, !Sub "${ArtifactsBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  OpsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OpsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt OpsBucket.Arn, !Sub "${OpsBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------- CloudFormation execution role
+  # CI never gets these permissions directly: it can only hand this role to CloudFormation.
+  # Generated names (roles, topics, rules) start with the stack name, which starts with AppName;
+  # CloudFormation may shorten long generated names, so the patterns match on the AppName prefix.
+  CloudFormationExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "Used by CloudFormation to create and update the ${AppName} app stacks."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app-resources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AppBuckets
+                Effect: Allow
+                Action: "s3:*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppName}*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppName}*/*"
+              - Sid: ReadPackagedCode
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${ArtifactsBucket.Arn}/*"
+              - Sid: AppFunctions
+                Effect: Allow
+                Action: "lambda:*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CodeDeployHook_${AppName}-*"
+              - Sid: AppRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}*"
+              - Sid: PassAppRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - scheduler.amazonaws.com
+                      - codedeploy.amazonaws.com
+              - Sid: AppDelivery
+                Effect: Allow
+                Action: ["cloudfront:*", "codedeploy:*", "cloudwatch:*"]
+                Resource: "*"
+              - Sid: AppLogs
+                Effect: Allow
+                Action: "logs:*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppName}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CodeDeployHook_${AppName}-*"
+              - Sid: LogsQueriesAndDescribe
+                Effect: Allow
+                Action: [logs:PutQueryDefinition, logs:DeleteQueryDefinition, logs:DescribeQueryDefinitions,
+                         logs:DescribeLogGroups, logs:ListTagsForResource]
+                Resource: "*"
+              - Sid: AppTopics
+                Effect: Allow
+                Action: "sns:*"
+                Resource: !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AppName}*"
+              - Sid: AppSchedulesAndRules
+                Effect: Allow
+                Action: ["scheduler:*", "events:*"]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${AppName}-*"
+                  - !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AppName}*"
+
+  # ---------------------------------------------------------------- GitHub Actions roles (OIDC)
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "GitHub Actions (${GitHubRepository}) release pipeline: package, deploy, smoke, rollback."
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/main"
+                  - !Sub "repo:${GitHubRepository}:environment:dev"
+                  - !Sub "repo:${GitHubRepository}:environment:production"
+      Policies:
+        - PolicyName: release-pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AppStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-*/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+              - Sid: TemplateSummary
+                Effect: Allow
+                Action: [cloudformation:GetTemplateSummary, cloudformation:ValidateTemplate]
+                Resource: "*"
+              - Sid: HandStackToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: ArtifactsAndSites
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub "${ArtifactsBucket.Arn}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppName}-*-sitebucket-*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AppName}-*-sitebucket-*/*"
+              - Sid: OpsEvalsAndRunRecords
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt OpsBucket.Arn
+                  - !Sub "${OpsBucket.Arn}/evals/*"
+                  - !Sub "${OpsBucket.Arn}/runs/*"
+              - Sid: InvalidateSite
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*"
+              - Sid: OperateFunctions
+                Effect: Allow
+                Action: [lambda:GetAlias, lambda:UpdateAlias, lambda:InvokeFunction, lambda:GetFunctionConfiguration,
+                         lambda:ListVersionsByFunction]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-*"
+              - Sid: ReleaseRegistry
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter, ssm:GetParameterHistory]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*"
+              - Sid: ReadAlarms
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: "*"
+              - Sid: EvalGate # the release pipeline replays eval cases with the real models
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:::foundation-model/anthropic.*"
+
+  GitHubEvalsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "GitHub Actions (${GitHubRepository}) eval runs on pull requests and on a schedule: Bedrock + eval data only."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubRepository}:pull_request"
+                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/*"
+      Policies:
+        - PolicyName: evals
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeModels
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:::foundation-model/anthropic.*"
+              - Sid: ReadEvalData
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt OpsBucket.Arn
+                  - !Sub "${OpsBucket.Arn}/evals/*"
+                  - !Sub "${OpsBucket.Arn}/runs/*"
+              - Sid: WriteReports
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${OpsBucket.Arn}/evals/reports/*"
+              - Sid: ReadLastGoodRelease # regression baseline
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*/release/last-good"
+
+  # ---------------------------------------------------------------- cost guardrail
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AppName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetEmail
+
+Outputs:
+  DeployRoleArn:
+    Description: GitHub variable AWS_ROLE_ARN (release and rollback workflows)
+    Value: !GetAtt GitHubDeployRole.Arn
+  EvalsRoleArn:
+    Description: GitHub variable AWS_EVALS_ROLE_ARN (eval workflow)
+    Value: !GetAtt GitHubEvalsRole.Arn
+  CloudFormationExecRoleArn:
+    Value: !GetAtt CloudFormationExecRole.Arn
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+  OpsBucketName:
+    Value: !Ref OpsBucket

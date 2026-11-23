@@ -4,9 +4,12 @@
   python run_local.py --live                 # real data + Claude on Bedrock -> web/data
   python run_local.py --live --no-llm        # real data, no Bedrock (headlines-only edition)
   python run_local.py --live --s3 BUCKET     # publish to the S3 bucket instead of web/data
+  python run_local.py --live --no-judge      # skip the online LLM judge (quality gate uses rules only)
 
 Live mode reads FINNHUB_API_KEY (or FINNHUB_KEY_PARAM with AWS credentials), SEC_USER_AGENT,
-MODEL_ID, BEDROCK_REGION, LANGUAGE, WATCHLIST... from the environment (see README).
+MODEL_ID, JUDGE_MODEL_ID, BEDROCK_REGION, LANGUAGE, WATCHLIST... from the environment (see README).
+Local live runs cache company profiles in .cache/ and write run records to .runs/ (replayable
+with: python -m stocknews.evals --dataset .runs/runs/<date>/).
 Then preview with:  python -m http.server 8000 --directory web
 """
 
@@ -37,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=str(ROOT / "web" / "data"), help="output data folder")
     parser.add_argument("--s3", metavar="BUCKET", help="publish to this S3 bucket instead of --out")
     parser.add_argument("--lang", choices=["en", "es"], help="override LANGUAGE")
+    parser.add_argument("--no-judge", action="store_true", help="skip the online LLM judge")
+    parser.add_argument("--no-record", action="store_true", help="do not write a run record to .runs/")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -46,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings.from_env()
     if args.lang:
         settings.language = args.lang
+    if args.no_judge:
+        settings.judge_enabled = False
+    settings.cache_dir = settings.cache_dir or str(ROOT / ".cache")
+    if not args.no_record:
+        settings.records_dir = settings.records_dir or str(ROOT / ".runs")
     cfg = load_config(settings)
     max_editions = limits(cfg)["manifestEditions"]
     publisher = (S3Publisher(args.s3, max_editions=max_editions) if args.s3
