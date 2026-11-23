@@ -9,6 +9,7 @@
   python scripts/deploy.py run --env dev [--slot close] # publish an edition now
   python scripts/deploy.py validate                     # cfn-lint + SAM transform + parameter checks (no AWS calls)
   python scripts/deploy.py check-models --env prod [--model-profile target]   # Bedrock access + schema preflight
+  python scripts/deploy.py github-setup                 # CI/CD: GitHub variables, secrets, environments
 
 Needs: Python 3.10+, boto3, the AWS SAM CLI and AWS credentials (or the GitHub OIDC role in CI).
 Release id = the git commit SHA. Parameters per environment live in infra/params/<env>.json;
@@ -22,6 +23,8 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -78,7 +81,6 @@ def build_site(release: str) -> Path:
 def cmd_validate(args) -> None:
     """cfn-lint both templates and run the SAM transform for each environment (offline)."""
     import copy
-    import shutil
 
     os.environ.setdefault("AWS_DEFAULT_REGION", args.region or "us-east-1")
     try:
@@ -436,6 +438,108 @@ def cmd_release(args) -> None:
     cmd_site(args)
 
 
+# ---- GitHub Actions (CI/CD) -------------------------------------------------------------------------
+CI_CHECK = "lint, tests, templates"  # the job name in .github/workflows/ci.yml
+GH_INSTALL = "install the GitHub CLI: winget install --id GitHub.cli, then run: gh auth login"
+
+
+def gh(args: list[str], body: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the GitHub CLI; `body` goes to stdin as JSON (for `gh api ... --input -`)."""
+    return subprocess.run([tool("gh", GH_INSTALL), *args], input=None if body is None else json.dumps(body),
+                          text=True, capture_output=True, check=False)
+
+
+def github_variables(boot: dict, region: str) -> dict[str, str]:
+    """Repository variables the workflows read (.github/workflows/*.yml)."""
+    return {"AWS_ROLE_ARN": boot["DeployRoleArn"], "AWS_EVALS_ROLE_ARN": boot["EvalsRoleArn"],
+            "OPS_BUCKET": boot["OpsBucketName"], "AWS_REGION": region}
+
+
+def github_secrets(alarm_email: str = "", sec_user_agent: str = "") -> dict[str, str]:
+    """Values with an email address go in as secrets: GitHub masks secrets in the (public) logs."""
+    return {k: v for k, v in (("ALARM_EMAIL", alarm_email), ("SEC_USER_AGENT", sec_user_agent)) if v}
+
+
+def github_settings(repo: str, reviewer_id: int) -> list[tuple[str, list[str], dict | None, bool]]:
+    """(what, gh args, JSON body, required) for the environments and the branch protection."""
+    only_main = {"protected_branches": False, "custom_branch_policies": True}
+    steps: list[tuple[str, list[str], dict | None, bool]] = []
+    for env, extra in (("dev", {}), ("production", {"reviewers": [{"type": "User", "id": reviewer_id}]})):
+        steps.append((f"environment {env}" + (" (you approve each deployment)" if extra else ""),
+                      ["api", "--method", "PUT", f"repos/{repo}/environments/{env}", "--input", "-"],
+                      {"deployment_branch_policy": only_main, **extra}, True))
+        steps.append((f"environment {env}: deployments only from main",
+                      ["api", "--method", "POST", f"repos/{repo}/environments/{env}/deployment-branch-policies",
+                       "--input", "-"], {"name": "main", "type": "branch"}, False))
+    steps.append((f"branch protection: main requires the '{CI_CHECK}' check",
+                  ["api", "--method", "PUT", f"repos/{repo}/branches/main/protection", "--input", "-"],
+                  {"required_status_checks": {"strict": False, "checks": [{"context": CI_CHECK}]},
+                   "enforce_admins": False, "required_pull_request_reviews": None, "restrictions": None}, False))
+    return steps
+
+
+def _manual_github_steps(repo: str, variables: dict[str, str], secrets: list[str]) -> str:
+    width = max(len(k) for k in variables)
+    lines = [f"Set these in https://github.com/{repo}/settings/variables/actions (tab Variables, New repository "
+             "variable):"]
+    lines += [f"  {k.ljust(width)}  {v}" for k, v in variables.items()]
+    lines += [f"In https://github.com/{repo}/settings/secrets/actions (tab Secrets, New repository secret) add "
+              + (" and ".join(secrets) + " with the values you passed" if secrets else
+                 "ALARM_EMAIL (your email for alarms) and SEC_USER_AGENT (\"Your Name you@example.com\")")
+              + ". Secrets are masked in the logs.",
+              f"Then in https://github.com/{repo}/settings/environments create 'dev' and 'production'; on "
+              "'production' tick Required reviewers and add yourself; on both, Deployment branches and tags > "
+              "Selected branches > main.",
+              f"Optional: https://github.com/{repo}/settings/branches > protect main and require the "
+              f"'{CI_CHECK}' status check."]
+    return "\n".join(lines)
+
+
+def cmd_github_setup(args) -> None:
+    sess = session(args.region, args.profile)
+    boot = _bootstrap(sess)
+    repo = args.repo or previous_parameters(sess, bootstrap_stack()).get("GitHubRepository")
+    if not repo:
+        raise SystemExit("pass --repo OWNER/REPO (the repository the bootstrap roles trust)")
+    variables = github_variables(boot, sess.region_name)
+    secrets = github_secrets(args.alarm_email or os.environ.get("ALARM_EMAIL", ""),
+                             args.sec_user_agent or os.environ.get("SEC_USER_AGENT", ""))
+    if args.dry_run or not shutil.which("gh"):
+        if not args.dry_run:
+            print(f"The GitHub CLI was not found ({GH_INSTALL}); here is the same setup by hand.\n")
+        print(_manual_github_steps(repo, variables, list(secrets)))
+        return
+    if gh(["auth", "status"]).returncode != 0:
+        raise SystemExit("the GitHub CLI is not signed in: run gh auth login, then this command again")
+    for name, value in variables.items():
+        r = gh(["variable", "set", name, "--repo", repo, "--body", value])
+        if r.returncode != 0:
+            raise SystemExit(f"could not set {name} on {repo}: {(r.stderr or r.stdout).strip()}\n"
+                             "(you need admin rights on the repository)")
+        print(f"variable {name} = {value}")
+    for name, value in secrets.items():
+        r = gh(["secret", "set", name, "--repo", repo, "--body", value])
+        if r.returncode != 0:
+            raise SystemExit(f"could not set the secret {name} on {repo}: {(r.stderr or r.stdout).strip()}")
+        print(f"secret {name} set")
+    if not secrets:
+        print("no ALARM_EMAIL / SEC_USER_AGENT given: the stacks keep their current values (a new stack gets none)")
+    me = gh(["api", "user", "--jq", ".id"])
+    if me.returncode != 0 or not me.stdout.strip().isdigit():
+        raise SystemExit(f"could not read your GitHub user: {(me.stderr or me.stdout).strip()}")
+    for what, gh_args, body, required in github_settings(repo, int(me.stdout.strip())):
+        r = gh(gh_args, body)
+        output = (r.stderr or r.stdout).strip()
+        if r.returncode == 0 or "already exists" in output.lower():
+            print(f"{what}: ok")
+        elif required:
+            raise SystemExit(f"{what}: {output}")
+        else:
+            print(f"{what}: skipped ({output[:200]})")
+    print(f"\nDone. Merges to main now run the release workflow: package -> eval gate -> dev -> production "
+          f"(waits for your approval). Start one now with: gh workflow run release --repo {repo} --ref main")
+
+
 def cmd_run(args) -> None:
     sess = session(args.region, args.profile)
     out = outputs(sess, app_stack(args.env))
@@ -481,6 +585,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--env", required=True, choices=["dev", "prod"])
     p.add_argument("--model-profile", help="check another profile of infra/models.json (e.g. target)")
     p.set_defaults(fn=cmd_check_models)
+    p = sub.add_parser("github-setup", help="GitHub Actions variables, environments and branch protection for CI/CD")
+    p.add_argument("--repo", help="OWNER/REPO (default: the repository the bootstrap stack trusts)")
+    p.add_argument("--alarm-email", help="ALARM_EMAIL secret: alarm and rollback emails for the stacks CI deploys "
+                                         "(default: the ALARM_EMAIL environment variable)")
+    p.add_argument("--sec-user-agent", help='SEC_USER_AGENT secret, e.g. "Your Name you@example.com" (default: the '
+                                            "SEC_USER_AGENT environment variable)")
+    p.add_argument("--dry-run", action="store_true", help="print the settings instead of applying them")
+    p.set_defaults(fn=cmd_github_setup)
     p = sub.add_parser("run", help="publish an edition now")
     p.add_argument("--env", required=True, choices=["dev", "prod"])
     p.add_argument("--slot", choices=["premarket", "midday", "close", "weekend"])

@@ -169,10 +169,10 @@ def params(env: str, model_profile: str | None = None) -> dict[str, str]:
                              model_profile=model_profile)
 
 
-def tool(name: str) -> str:
+def tool(name: str, install: str = "install the AWS SAM CLI") -> str:
     found = shutil.which(name)  # resolves sam.cmd / sam.exe on Windows
     if not found:
-        raise SystemExit(f"'{name}' was not found in PATH (install the AWS SAM CLI)")
+        raise SystemExit(f"'{name}' was not found in PATH ({install})")
     return found
 
 

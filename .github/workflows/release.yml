@@ -7,8 +7,10 @@ name: release
 # Rollbacks: automatic during the bake (rollback alarms), or the "operate" workflow at any time.
 #
 # Repository variables: AWS_ROLE_ARN, OPS_BUCKET (bootstrap outputs), optional AWS_REGION,
-# RUNNER_LABEL, ALARM_EMAIL, SEC_USER_AGENT, EVALS_MAX_CASES.
+# RUNNER_LABEL, EVALS_MAX_CASES. Repository secrets (optional): ALARM_EMAIL, SEC_USER_AGENT; they
+# contain an email address, and secrets are masked in the logs, which are public on a public repo.
 # Environments: "dev" and "production" (add yourself as a required reviewer on production).
+# One-time setup: python scripts/deploy.py github-setup (README, section 3).
 on:
   push:
     branches: [main]
@@ -84,8 +86,8 @@ jobs:
     environment: dev
     timeout-minutes: 45
     env:
-      ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
-      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+      ALARM_EMAIL: ${{ secrets.ALARM_EMAIL || vars.ALARM_EMAIL }}
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || vars.SEC_USER_AGENT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -112,8 +114,8 @@ jobs:
     environment: production
     timeout-minutes: 45
     env:
-      ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
-      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+      ALARM_EMAIL: ${{ secrets.ALARM_EMAIL || vars.ALARM_EMAIL }}
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || vars.SEC_USER_AGENT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
