@@ -254,6 +254,57 @@ def test_agent_writes_with_the_schema_in_the_prompt_when_the_grammar_is_too_larg
                for b in m["content"]) == 1
 
 
+def _with_made_up_figure(cfg, pool, snapshot):
+    draft = good_analysis(cfg, pool, snapshot)
+    note = draft["top20"][0]
+    quote = snapshot.quote(note["ticker"])
+    assert abs(abs(quote["changePct"]) - 42.5) > 1  # a figure that is not in MARKET DATA
+    note["note"] = "Shares jumped 42.5% on the news."
+    return draft, note["ticker"]
+
+
+def test_agent_sends_unverified_figures_back_once(ctx, cfg, settings, world):
+    snapshot, pool = world
+    settings.research_tools = False
+    draft, sym = _with_made_up_figure(cfg, pool, snapshot)
+
+    def corrected(body):
+        msg = body["messages"][-1]["content"][0]["text"]
+        assert f'top20 note for {sym}: the figure "42.5%" matches neither MARKET DATA' in msg
+        return text_response(good_analysis(cfg, pool, snapshot))
+
+    fake = ScriptedBedrock([text_response(draft), corrected])
+    llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
+    result = NewsAgent(llm, settings, tools=None).run(ctx, cfg, snapshot, pool)
+    assert result.report.ok and result.repairs == 1 and result.first_report.ok  # first pass was valid
+    assert "42.5%" not in json.dumps(result.analysis)
+    assert result.notes == ["Figure check: 1 unverified figure(s) sent back to the model"]
+
+
+def test_agent_keeps_the_valid_draft_when_the_figure_round_breaks_it(ctx, cfg, settings, world):
+    snapshot, pool = world
+    settings.research_tools, settings.max_repairs = False, 1
+    draft, _ = _with_made_up_figure(cfg, pool, snapshot)
+    broken = good_analysis(cfg, pool, snapshot)
+    broken["top20"] = broken["top20"][:-1]  # the "corrected" draft forgot a company
+    fake = ScriptedBedrock([text_response(draft), text_response(broken)])
+    llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
+    result = NewsAgent(llm, settings, tools=None).run(ctx, cfg, snapshot, pool)
+    assert result.report.ok and "42.5%" in json.dumps(result.analysis)  # the gate will withhold that note
+    assert result.notes[-1].startswith("Kept the last valid draft")
+    assert not any(n.startswith("Validation issues left") for n in result.notes)
+
+
+def test_agent_does_not_send_figures_back_without_a_repair_round_left(ctx, cfg, settings, world):
+    snapshot, pool = world
+    settings.research_tools, settings.max_repairs = False, 0
+    draft, _ = _with_made_up_figure(cfg, pool, snapshot)
+    fake = ScriptedBedrock([text_response(draft)])  # a second call would fail the test
+    llm = BedrockClaude(settings.model_id, "us-east-1", effort="medium", client=fake)
+    result = NewsAgent(llm, settings, tools=None).run(ctx, cfg, snapshot, pool)
+    assert result.report.ok and result.repairs == 0 and result.notes == []
+
+
 def test_agent_stops_when_lambda_time_is_short(ctx, cfg, settings, world, fake_fh):
     from stocknews.agent import AgentError
 

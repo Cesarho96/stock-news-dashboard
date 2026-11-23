@@ -108,7 +108,7 @@ python -m stocknews.evals --params ../infra/params/prod.json --dataset seed: --d
 
 ## 4. The quality gate (before every edition)
 
-After the writer's JSON passes validation, `pipeline.produce()` runs the deterministic checks and the judge, then `quality.decide()`:
+After the writer's JSON passes validation, the agent runs the figure check once on the draft: figures that match neither MARKET DATA nor the evidence cited in the same entry go back to the model in a repair round, with the instruction to correct them from the data, cite their source or remove them (the run keeps the last valid draft if that round breaks it). Then `pipeline.produce()` runs the deterministic checks and the judge, and `quality.decide()`:
 
 | Finding | Decision | Corrective action applied automatically |
 |---|---|---|
@@ -162,7 +162,7 @@ Start with `python scripts/release.py status --env prod` (or **operate** → `st
 
 **Low groundedness / withheld sections.** Open the quality section of the run record (`quality.judge.problems`, `quality.checks.unverified`): unsupported causes ("rose on…") mean the prompt needs tightening; wrong figures mean the model ignored MARKET DATA. Replay the case against a prompt change locally, then PR (the evals must pass). If it happens on many editions at once with no release, suspect model drift behind the inference profile: run the `evals` workflow on the golden set and compare with the last good report.
 
-**Unverified figures alarm.** Same as above, focused on numbers; check whether a data source changed format (e.g. prices in summaries).
+**Unverified figures alarm.** Same as above, focused on numbers; check whether a data source changed format (e.g. prices in summaries). Figures still unverified after the figure repair round are ones the model kept from memory (year-to-date moves, growth rates) or moves attributed to the wrong ticker; the `Figure check` note in `qa.notes` shows how many were sent back.
 
 **Judge errors.** Rules-only checks keep running. Check Haiku model access and quotas; the release pipeline will not pass the eval gate until the judge works again.
 

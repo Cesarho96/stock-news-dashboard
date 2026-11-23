@@ -5,7 +5,8 @@ Conversation (Anthropic Messages format on Bedrock):
   assistant: tool calls ... -> research note                (phase 1, tools: auto)
   user:      STEP 2 write instruction
   assistant: edition JSON                                   (phase 2, tools: none, JSON schema)
-  user:      repair message (only if validation finds hard problems), up to N rounds
+  user:      repair message, up to N rounds: validation problems, or (once, on a valid
+             draft) figures that match neither MARKET DATA nor the evidence cited with them
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from .clock import EditionContext
 from .evidence import EvidencePool
 from .llm import BedrockClaude, LLMError
 from .market import MarketSnapshot, coverage
+from .quality import unverified_numbers
 from .schema import analysis_schema, tool_definitions
 from .settings import Settings
 from .tools import ResearchTools
@@ -48,6 +50,21 @@ class AgentResult:
 
 def _text_of(content: list) -> str:
     return "".join(b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
+
+
+def _where(unit_id: str) -> str:
+    """'top20:XOM' -> 'top20 note for XOM'; 'latest:1' -> 'latest[1]'; 'top.keyAlert' unchanged."""
+    section, _, key = unit_id.partition(":")
+    if not key:
+        return unit_id
+    return f"{section} note for {key}" if section in ("top20", "watchlist") else f"{section}[{key}]"
+
+
+def figure_problems(figures: list[dict]) -> list[str]:
+    return [f'{_where(f["unit"])}: the figure "{f["value"]}" matches neither MARKET DATA for the companies it names '
+            "nor the evidence cited in this entry. Take it from MARKET DATA (if it is another symbol's move, name "
+            "that symbol next to it, e.g. \"oil (USO)\"), cite the evidence item that states it, or remove it. No "
+            "figures from memory, such as year-to-date moves that no cited item states." for f in figures]
 
 
 def parse_json_text(text: str) -> dict:
@@ -134,6 +151,8 @@ class NewsAgent:
         analysis: dict | None = None
         report = Report()
         first_report: Report | None = None
+        last_valid: tuple[dict, Report] | None = None
+        figures_sent = False
         repairs = 0
         notes: list[str] = []
         for attempt in range(self.settings.max_repairs + 1):
@@ -160,9 +179,19 @@ class NewsAgent:
                 report = Report(issues=[Issue("$", f"not valid JSON ({exc})")])
             if first_report is None:
                 first_report = report
+            if not problems and analysis is not None:
+                last_valid = (analysis, report)
+                if not figures_sent:
+                    # Corrective step before the quality gate: figures the gate would withhold go back
+                    # to the model once, with the instruction to correct, source or remove them.
+                    figures = unverified_numbers(analysis, snapshot, pool, cfg)
+                    if figures and attempt < self.settings.max_repairs and self._time_left() >= 240:
+                        figures_sent = True
+                        problems = figure_problems(figures)
+                        notes.append(f"Figure check: {len(figures)} unverified figure(s) sent back to the model")
             if not problems:
                 break
-            log.warning("validation round %d: %d problems: %s", attempt, len(problems), problems[:5])
+            log.warning("repair round %d: %d problems: %s", attempt, len(problems), problems[:5])
             if attempt >= self.settings.max_repairs:
                 notes.append(f"Validation issues left after {repairs} repair round(s): {len(problems)}")
                 break
@@ -173,6 +202,11 @@ class NewsAgent:
             repair = prompts.repair_message(problems, truncated)
             messages.append({"role": "user", "content": [{"type": "text", "text": repair}]})
 
+        if not report.ok and last_valid is not None:
+            # a later round broke a draft that was valid: publish the valid one (the gate handles its figures)
+            analysis, report = last_valid
+            notes = [n for n in notes if not n.startswith("Validation issues left")]
+            notes.append("Kept the last valid draft: a later repair round introduced validation issues")
         if analysis is None:
             raise AgentError("the model never returned valid JSON")
         return AgentResult(

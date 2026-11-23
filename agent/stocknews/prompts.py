@@ -14,7 +14,7 @@ from .clock import EditionContext
 from .evidence import EvidencePool
 from .market import MarketSnapshot, coverage, fmt_cap, market_table
 
-PROMPT_VERSION = "2026-11-23.top20"
+PROMPT_VERSION = "2026-11-23.figures"
 LANGUAGE_NAMES = {"en": "English", "es": "Spanish (Mexico), neutral business register"}
 
 
@@ -27,7 +27,7 @@ Write every text field in {lang}.
 Accuracy rules (the most important part of the job):
 1. Use only facts that appear in the EVIDENCE list, the MARKET DATA and TOP 20 tables, the EARNINGS calendar, or research tool results. Do not add facts from memory, do not guess, and do not invent quotes, figures, dates or sources.
 2. Cite evidence IDs (E001, E002, ...) for every story. Put the most important supporting item first. Only cite IDs that exist in the list.
-3. Prices and percentage moves must match MARKET DATA. Index levels are shown through ETFs (SPY, QQQ, DIA, IWM); call them "the S&P 500 ETF (SPY)" and similar, never quote an index level that is not in the data.
+3. Every figure (prices, percentage moves, dollar amounts, growth rates) must come from MARKET DATA or from an evidence item you cite in the same entry; rounding is fine. Leave out figures you only know from memory, such as year-to-date moves. Index levels are shown through ETFs (SPY, QQQ, DIA, IWM); call them "the S&P 500 ETF (SPY)" and similar, never quote an index level that is not in the data.
 4. Items marked NEW were published inside this edition's news window; items marked ctx are older context (up to 7 days). Stories in "top" and "latest" must cite at least one NEW item. Use ctx items only as background.
 5. "Top of the day" (top and top20) covers ONLY the companies in the TOP 20 table. Macro news and other companies belong in latest, sectors or radar.
 6. One fact, one place: never feature the same story twice across top, latest and sectors. If a story leads the top section, do not repeat it in latest; use a different angle or a different story.
