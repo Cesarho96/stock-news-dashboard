@@ -172,7 +172,7 @@ Start with `python scripts/release.py status --env prod` (or **operate** → `st
 
 **A bad edition is visible.** **operate** → `withdraw` (edition id from the page URL `?edition=…` or `status`), then rollback or kill switch as appropriate.
 
-**Changing models** (for example from the interim `haiku-4-5` profile back to `target`). Run `check-models --model-profile target`; evaluate the candidate on the golden set with `python -m stocknews.evals --params ../infra/params/prod.json --model-profile target`; then change `ModelProfile` in the params files through a PR. The eval gate compares it with the last good release, the smoke test runs it before it goes live, and the bake decides whether it becomes the new last good release; a regression during the bake rolls back to the previous models automatically. Edit thresholds only through a reviewed PR, not to make a weaker model pass.
+**Changing models** (for example from the interim `sonnet-4-6` profile back to `target`). Run `check-models --model-profile target`; evaluate the candidate on the golden set with `python -m stocknews.evals --params ../infra/params/prod.json --model-profile target`; then change `ModelProfile` in the params files through a PR. The eval gate compares it with the last good release, the smoke test runs it before it goes live, and the bake decides whether it becomes the new last good release; a regression during the bake rolls back to the previous models automatically. Edit thresholds only through a reviewed PR, not to make a weaker model pass.
 
 ## 7. Preventive strategies
 

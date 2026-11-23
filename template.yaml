@@ -50,7 +50,7 @@ Parameters:
     Type: String
     Default: adaptive
     AllowedValues: [adaptive, "off"]
-    Description: Writer thinking mode. Use "off" for models without adaptive thinking (Claude Haiku 4.5).
+    Description: Writer thinking mode. Use "off" for models without adaptive thinking (Claude Haiku 4.5 and older).
   JudgeEffort:
     Type: String
     Default: low

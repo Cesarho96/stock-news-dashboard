@@ -156,6 +156,11 @@ FEATURE_HINTS = {
 
 def access_advice(message: str) -> str:
     msg = message.lower()
+    if "not available for this account" in msg:
+        return ("AWS restricts this model for your account. Waiting, retrying, IAM or model access settings will not "
+                "change that (Service Quotas may show 0 for it). Ask AWS to lift the restriction: Support Center > "
+                "Create case > Account and billing (free on every support plan), and/or the AWS Sales form linked in "
+                "the error. Meanwhile use a model profile whose models pass this check.")
     if "use case" in msg or "use-case" in msg:
         return ("Submit Anthropic's one-time use-case form: Bedrock console > Model catalog > pick an Anthropic "
                 "model > Submit use case details. Access is usually immediate (allow up to 15 minutes).")

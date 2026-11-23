@@ -20,14 +20,16 @@ import deploy  # noqa: E402
 
 def test_repo_profiles_and_params():
     profiles = load_profiles(ROOT / "infra" / "models.json")
-    assert {"target", "haiku-4-5"} <= set(profiles)
+    assert {"target", "sonnet-4-6", "haiku-4-5"} <= set(profiles)
     assert profiles["target"]["ModelId"] == "global.anthropic.claude-sonnet-5-5"
     assert profiles["target"]["JudgeModelId"] == "global.anthropic.claude-haiku-5-5"
     for env in ("dev", "prod"):
         values = load_stack_params(ROOT / "infra" / "params" / f"{env}.json")
         assert "ModelProfile" not in values and not any(k.startswith("_") for k in values)
-        assert values["ModelId"] == values["JudgeModelId"] == "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-        assert values["Effort"] == "none" and values["Thinking"] == "off" and values["PriceInputMtok"] == "1"
+        assert values["ModelId"] == "global.anthropic.claude-sonnet-4-6"  # writer and judge differ
+        assert values["JudgeModelId"] == "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert values["Effort"] == "medium" and values["Thinking"] == "adaptive" and values["PriceInputMtok"] == "3"
+        assert values["JudgeEffort"] == "none" and values["JudgeThinking"] == "off"
 
 
 def test_profile_expansion_and_overrides(tmp_path):
@@ -48,13 +50,17 @@ def test_profile_expansion_and_overrides(tmp_path):
 def test_eval_runner_applies_the_interim_profile():
     s = Settings()
     lang = runner.apply_params(s, load_stack_params(ROOT / "infra" / "params" / "prod.json"))
-    assert lang == "en" and s.model_id.startswith("global.anthropic.claude-haiku-4-5")
-    assert s.effort == "" and s.thinking == "off" and s.judge_effort == "" and s.judge_thinking == "off"
-    assert s.price_input_mtok == 1.0 and s.price_output_mtok == 5.0
-    llm = BedrockClaude(s.model_id, "us-east-1", s.effort, s.thinking, client=ScriptedBedrock([]))
-    body = llm._body("sys", [], None, None, {"type": "object"})
-    assert "thinking" not in body and "effort" not in body.get("output_config", {})
+    assert lang == "en" and s.model_id == "global.anthropic.claude-sonnet-4-6"
+    assert s.effort == "medium" and s.thinking == "adaptive" and s.judge_effort == "" and s.judge_thinking == "off"
+    assert s.price_input_mtok == 3.0 and s.price_output_mtok == 15.0
+    assert s.judge_model_id.startswith("global.anthropic.claude-haiku-4-5")
+    writer = BedrockClaude(s.model_id, "us-east-1", s.effort, s.thinking, client=ScriptedBedrock([]))
+    body = writer._body("sys", [], None, None, {"type": "object"})
+    assert body["thinking"] == {"type": "adaptive"} and body["output_config"]["effort"] == "medium"
     assert body["output_config"]["format"]["type"] == "json_schema"  # structured outputs stay on
+    judge = BedrockClaude(s.judge_model_id, "us-east-1", s.judge_effort, s.judge_thinking, client=ScriptedBedrock([]))
+    body = judge._body("sys", [], None, None, {"type": "object"})
+    assert "thinking" not in body and "effort" not in body.get("output_config", {})  # Haiku 4.5 has neither
 
 
 def test_judge_client_follows_judge_settings(monkeypatch):
@@ -82,6 +88,9 @@ def test_check_model_reports_dropped_features():
     ("AccessDeniedException", "not authorized to perform: aws-marketplace:Subscribe", "aws-marketplace:Subscribe"),
     ("ResourceNotFoundException", "Model use case details have not been submitted for this account.", "use-case form"),
     ("ThrottlingException", "Too many tokens, please wait before trying again.", "Service Quotas"),
+    ("AccessDeniedException", "anthropic.claude-sonnet-5-5 is not available for this account. You can explore other "
+                              "available models on Amazon Bedrock. For additional access options, contact AWS Sales.",
+     "Account and billing"),
     ("ValidationException", "The provided model identifier is invalid.", "inference profile id"),
     ("ValidationException", "Invocation of model ID anthropic.claude-sonnet-5-5 with on-demand throughput isn't "
                             "supported. Retry your request with the ID or ARN of an inference profile.",
