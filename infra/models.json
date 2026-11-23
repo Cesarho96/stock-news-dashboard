@@ -13,8 +13,21 @@
     "JudgePriceInputMtok": "1",
     "JudgePriceOutputMtok": "5"
   },
+  "sonnet-4-6": {
+    "_comment": "Interim setup while Claude Sonnet 5.5 and Haiku 5.5 are not available for this account (AWS account-level restriction; a Support case asks to lift it): Claude Sonnet 4.6 writes with adaptive thinking, Claude Haiku 4.5 judges, so the writer does not grade its own work. Global inference prices from the AWS Marketplace listings.",
+    "ModelId": "global.anthropic.claude-sonnet-4-6",
+    "Effort": "medium",
+    "Thinking": "adaptive",
+    "PriceInputMtok": "3",
+    "PriceOutputMtok": "15",
+    "JudgeModelId": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "JudgeEffort": "none",
+    "JudgeThinking": "off",
+    "JudgePriceInputMtok": "1",
+    "JudgePriceOutputMtok": "5"
+  },
   "haiku-4-5": {
-    "_comment": "Interim setup while the account only has Claude Haiku 4.5: it writes and judges. This model takes no effort parameter and no adaptive thinking. Self-grading is lenient, so read groundedness scores as optimistic.",
+    "_comment": "First interim setup (Claude Haiku 4.5 writes and judges), kept as a fallback. This model takes no effort parameter and no adaptive thinking. Self-grading is lenient, so read groundedness scores as optimistic.",
     "ModelId": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "Effort": "none",
     "Thinking": "off",

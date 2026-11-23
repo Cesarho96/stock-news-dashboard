@@ -29,7 +29,7 @@ flowchart LR
   A -->|quotes, profiles, news| FH[Finnhub]
   A -->|filings| SEC[SEC EDGAR]
   A -->|headlines| RSS[RSS feeds]
-  A <-->|"research + JSON schema"| W["Claude writer<br/>(Sonnet 5.5 · interim Haiku 4.5)"]
+  A <-->|"research + JSON schema"| W["Claude writer<br/>(Sonnet 5.5 · interim Sonnet 4.6)"]
   A <-->|groundedness verdicts| J["Claude judge<br/>(Haiku 5.5 · interim Haiku 4.5)"]
   A -->|edition + manifest| S3[("Site bucket<br/>releases/&lt;sha&gt;/ + data/")]
   A -->|run record| OPS[("Ops bucket<br/>runs/ · evals/ · cache/")]
@@ -97,7 +97,7 @@ The demo edition is synthetic placeholder content (headlines start with `[Demo]`
 
 Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM CLI and credentials for your account. The steps use `us-east-1`.
 
-1. **Check model access.** `python scripts/deploy.py check-models --env prod` sends one tiny request to the models of the environment's model profile and explains any problem (see [Models](#models-profiles-access-and-switching-back)). It also sends the writer's real edition schema and says whether the model compiles it for structured output or the agent will describe it in the prompt. The repository currently deploys the interim `haiku-4-5` profile.
+1. **Check model access.** `python scripts/deploy.py check-models --env prod` sends one tiny request to the models of the environment's model profile and explains any problem (see [Models](#models-profiles-access-and-switching-back)). It also sends the writer's real edition schema and says whether the model compiles it for structured output or the agent will describe it in the prompt. The repository currently deploys the interim `sonnet-4-6` profile.
 2. **Store your Finnhub key** (free at finnhub.io):
    ```powershell
    aws ssm put-parameter --region us-east-1 --type SecureString `
@@ -124,7 +124,7 @@ If a deployment fails, the script prints the stack status and the reason CloudFo
 
 | Parameter | prod | Notes |
 |---|---|---|
-| `ModelProfile` | `haiku-4-5` | Writer and judge models, effort, thinking and prices from `infra/models.json` (`target` = Sonnet 5.5 + Haiku 5.5). |
+| `ModelProfile` | `sonnet-4-6` | Writer and judge models, effort, thinking and prices from `infra/models.json` (`target` = Sonnet 5.5 + Haiku 5.5). |
 | `JudgeEnabled` | `true` | LLM judge used by the quality gate. |
 | `QualityFloor` / `QualityTarget` | `0.6` / `0.8` | Groundedness under the floor withholds all AI text; under the target the edition is marked degraded. |
 | `BakeEditions` | `3` | Good editions before a release becomes the rollback target (dev: 1). |
@@ -142,17 +142,18 @@ If a deployment fails, the script prints the stack status and the reason CloudFo
 | Profile | Writer | Judge | Notes |
 |---|---|---|---|
 | `target` | Claude Sonnet 5.5 (effort medium, adaptive thinking) | Claude Haiku 5.5 | the intended setup |
-| `haiku-4-5` (**active now**) | Claude Haiku 4.5 (no effort parameter, thinking off) | Claude Haiku 4.5 | interim, while the account only has Haiku 4.5; about half the cost; the same model grades its own work, so read groundedness as optimistic |
+| `sonnet-4-6` (**active now**) | Claude Sonnet 4.6 (effort medium, adaptive thinking) | Claude Haiku 4.5 | interim, while AWS restricts Sonnet 5.5 and Haiku 5.5 on this account; writer prices $3 / $15 per million tokens |
+| `haiku-4-5` | Claude Haiku 4.5 (no effort parameter, thinking off) | Claude Haiku 4.5 | first interim setup, kept as a fallback; the same model grades its own work, so read groundedness as optimistic |
 
-**Getting access to the other models.** Bedrock enables serverless models automatically: the first call to a model subscribes the account through AWS Marketplace. That first call must come from an identity with `aws-marketplace:Subscribe`, `aws-marketplace:Unsubscribe` and `aws-marketplace:ViewSubscriptions` (an administrator has them), and it can take up to 2 minutes. Anthropic's one-time use-case form applies to older models such as Claude Haiku 4.5, so your account has already done it. To try:
+**Getting access to the other models.** Bedrock enables serverless models automatically: the first call to a model subscribes the account through AWS Marketplace. That first call must come from an identity with `aws-marketplace:Subscribe`, `aws-marketplace:Unsubscribe` and `aws-marketplace:ViewSubscriptions` (an administrator has them), and the setup can take up to 15 minutes. Anthropic's one-time use-case form applies only to models older than Claude Opus 4.7 (such as Claude Haiku 4.5 and Sonnet 4.6), so your account has already done it. To try:
 
 1. Bedrock console (us-east-1) > **Model catalog** > Claude Sonnet 5.5 > **Open in playground**, send one prompt; same for Claude Haiku 5.5. Or run `python scripts/deploy.py check-models --env prod --model-profile target` with administrator credentials.
-2. If it still answers *access denied*, access to that model is restricted for your account; for that case the Bedrock documentation says to contact AWS Sales (or your AWS account team). If it answers *throttling*, ask for a higher tokens-per-minute quota in **Service Quotas**.
+2. If it answers *"… is not available for this account"* (agreement `NOT_AVAILABLE`), AWS restricts that model for your account: waiting, retrying, IAM or model access settings do not change it. Ask AWS to lift it with a Support case (**Account and billing**, free on every support plan) and/or the AWS Sales form linked in the error. This is the current state for Sonnet 5.5 and Haiku 5.5, hence the `sonnet-4-6` profile. If it answers *throttling*, ask for a higher tokens-per-minute quota in **Service Quotas**.
 
 **Switching back to `target`** once `check-models --model-profile target` passes:
 
 1. Optional preview of the quality: `cd agent; python -m stocknews.evals --params ../infra/params/prod.json --model-profile target --dataset seed: --gate gate`.
-2. On a branch, set `"ModelProfile": "target"` in `infra/params/dev.json` and `infra/params/prod.json`, open a PR (the evals run with the new models), merge. The release pipeline deploys it through the smoke test and the bake; if it misbehaves, the automatic rollback returns to the Haiku 4.5 release.
+2. On a branch, set `"ModelProfile": "target"` in `infra/params/dev.json` and `infra/params/prod.json`, open a PR (the evals run with the new models), merge. The release pipeline deploys it through the smoke test and the bake; if it misbehaves, the automatic rollback returns to the previous release.
 
 ## 3. CI/CD with GitHub Actions
 
@@ -186,7 +187,7 @@ The eval report prints as Markdown (groundedness, validity, unverified figures, 
 
 ## Costs (estimate)
 
-- **Bedrock:** one edition is about 30–60K input tokens (mostly cached) and 8–15K output tokens for the writer, about $0.15–0.30 with Sonnet 5.5 at list price, plus about $0.01–0.03 for the Haiku judge. The interim `haiku-4-5` profile ($1 / $5 per million tokens) costs roughly half. Three editions per trading day ≈ **$10–20/month** in prod; dev adds about $4/month; each deployment smoke test and eval run costs about the same as one edition per case. Check the Bedrock pricing page for your endpoint. Every run logs and publishes its estimated cost.
+- **Bedrock:** one edition is about 30–60K input tokens (mostly cached) and 8–15K output tokens for the writer, about $0.15–0.30 with Sonnet 5.5 at list price, plus about $0.01–0.03 for the Haiku judge. The interim `sonnet-4-6` writer ($3 / $15 per million tokens) costs about 1.5 times that; `haiku-4-5` ($1 / $5) about half. Three editions per trading day ≈ **$10–20/month** in prod; dev adds about $4/month; each deployment smoke test and eval run costs about the same as one edition per case. Check the Bedrock pricing page for your endpoint. Every run logs and publishes its estimated cost.
 - **Lambda, S3, CloudFront, Scheduler, Parameter Store, CodeDeploy:** typically within the free tiers. CloudWatch custom metrics (about 25 per environment) and alarms cost a few dollars a month.
 - **Finnhub:** free plan (about 60 calls/minute); a run makes about 90 calls, plus 40 profile calls once a day.
 
