@@ -1,0 +1,135 @@
+name: release
+
+# Continuous delivery for main. Build once, deploy many:
+#   test -> package (one immutable artifact per commit) -> eval gate (real models, thresholds.json)
+#   -> dev (CodeDeploy smoke gate inside the deployment) -> production (environment approval,
+#   same artifact, same smoke gate) -> bake in production -> "last good" rollback target.
+# Rollbacks: automatic during the bake (rollback alarms), or the "operate" workflow at any time.
+#
+# Repository variables: AWS_ROLE_ARN, OPS_BUCKET (bootstrap outputs), optional AWS_REGION,
+# RUNNER_LABEL, ALARM_EMAIL, SEC_USER_AGENT, EVALS_MAX_CASES.
+# Environments: "dev" and "production" (add yourself as a required reviewer on production).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  RELEASE_ID: ${{ github.sha }}
+  OPS_BUCKET: ${{ vars.OPS_BUCKET }}
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    needs: test
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: python scripts/deploy.py package --release "$RELEASE_ID"
+
+  eval-gate:
+    needs: package
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      ENVIRONMENT: ci
+      MAX_CASES: ${{ vars.EVALS_MAX_CASES || '6' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Eval gate (blocks the release when quality thresholds fail)
+        working-directory: agent
+        run: |
+          args=(--params ../infra/params/prod.json --dataset seed: --gate gate --max-cases "$MAX_CASES" --summary "$GITHUB_STEP_SUMMARY")
+          if [ -n "$OPS_BUCKET" ]; then
+            args+=(--dataset "s3://$OPS_BUCKET/evals/datasets/golden/" --out "s3://$OPS_BUCKET/evals/reports/$RELEASE_ID.json")
+            baseline="$(python ../scripts/release.py baseline --env prod --quiet || true)"
+            [ -n "$baseline" ] && args+=(--baseline "$baseline")
+          fi
+          python -m stocknews.evals "${args[@]}"
+
+  deploy-dev:
+    needs: eval-gate
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: dev
+    timeout-minutes: 45
+    env:
+      ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
+      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+      - run: python scripts/release.py check-deployable --env dev --release "$RELEASE_ID"
+      - name: Deploy the stack (CodeDeploy runs the smoke test before the new version goes live)
+        run: python scripts/deploy.py app --env dev --release "$RELEASE_ID"
+      - run: python scripts/deploy.py site --env dev --release "$RELEASE_ID"
+      - run: python scripts/release.py status --env dev
+
+  deploy-prod:
+    needs: deploy-dev
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: production
+    timeout-minutes: 45
+    env:
+      ALARM_EMAIL: ${{ vars.ALARM_EMAIL }}
+      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+      - run: python scripts/release.py check-deployable --env prod --release "$RELEASE_ID"
+      - name: Deploy the stack (same artifact as dev; smoke gate again with the prod configuration)
+        run: python scripts/deploy.py app --env prod --release "$RELEASE_ID"
+      - run: python scripts/deploy.py site --env prod --release "$RELEASE_ID"
+      - run: python scripts/release.py status --env prod

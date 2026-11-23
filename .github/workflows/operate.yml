@@ -1,0 +1,66 @@
+name: operate
+
+# Incident response from GitHub (works from the mobile app too):
+#   rollback      move the live alias and the site back to the last good release (or a given SHA)
+#   ai-off/ai-on  kill switch: publish data-and-headlines editions without AI text, no deployment
+#   withdraw      remove a published edition from the dashboard (the file is kept)
+#   run-edition   publish an edition now
+#   status        registry, live version, recent editions and firing alarms
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        options: [status, rollback, ai-off, ai-on, withdraw, run-edition]
+        default: status
+      environment:
+        type: choice
+        options: [production, dev]
+        default: production
+      reason:
+        description: "Why (recorded in the release registry and the notifications)"
+        required: false
+      target_release:
+        description: "rollback: release SHA to restore (empty = last good)"
+        required: false
+      edition:
+        description: "withdraw: edition id, e.g. 2026-11-20-close"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  operate:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ACTION: ${{ inputs.action }}
+      TARGET_ENV: ${{ inputs.environment == 'production' && 'prod' || 'dev' }}
+      REASON: ${{ inputs.reason }}
+      TARGET_RELEASE: ${{ inputs.target_release }}
+      EDITION: ${{ inputs.edition }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install boto3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Run the action
+        run: |
+          case "$ACTION" in
+            status)      python scripts/release.py status --env "$TARGET_ENV" ;;
+            rollback)    args=(--env "$TARGET_ENV" --reason "${REASON:-rollback from GitHub}" --yes)
+                         [ -n "$TARGET_RELEASE" ] && args+=(--to-release "$TARGET_RELEASE")
+                         python scripts/release.py rollback "${args[@]}" ;;
+            ai-off)      python scripts/release.py kill-switch --env "$TARGET_ENV" --off --reason "${REASON:-kill switch from GitHub}" ;;
+            ai-on)       python scripts/release.py kill-switch --env "$TARGET_ENV" --on --reason "${REASON:-re-enabled from GitHub}" ;;
+            withdraw)    python scripts/release.py withdraw --env "$TARGET_ENV" --edition "$EDITION" --yes ;;
+            run-edition) python scripts/deploy.py run --env "$TARGET_ENV" ;;
+          esac

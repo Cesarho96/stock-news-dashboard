@@ -1,0 +1,66 @@
+name: evals
+
+# LLM evals with the real models on Amazon Bedrock:
+# - on pull requests that touch the agent (prompts, schema, validator, quality gate, config)
+# - every Monday on the golden dataset, to catch drift in the models behind the inference profiles
+# The report goes to the job summary; the job fails when the eval gate (thresholds.json) fails.
+on:
+  pull_request:
+    paths:
+      - "agent/stocknews/**"
+      - ".github/workflows/evals.yml"
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Extra dataset (s3://bucket/prefix/ or a path); the seed and golden sets always run"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evals:
+    if: vars.AWS_EVALS_ROLE_ARN != ''
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      OPS_BUCKET: ${{ vars.OPS_BUCKET }}
+      MAX_CASES: ${{ vars.EVALS_MAX_CASES || '6' }}
+      EXTRA_DATASET: ${{ inputs.dataset }}
+      ENVIRONMENT: ci
+      RELEASE_ID: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_EVALS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Run the eval suite
+        working-directory: agent
+        run: |
+          args=(--params ../infra/params/prod.json --dataset seed: --gate gate --max-cases "$MAX_CASES" --out ../.evals/report.json --summary "$GITHUB_STEP_SUMMARY")
+          if [ -n "$OPS_BUCKET" ]; then
+            args+=(--dataset "s3://$OPS_BUCKET/evals/datasets/golden/")
+            baseline="$(python ../scripts/release.py baseline --env prod --quiet || true)"
+            [ -n "$baseline" ] && args+=(--baseline "$baseline")
+          fi
+          [ -n "$EXTRA_DATASET" ] && args+=(--dataset "$EXTRA_DATASET")
+          python -m stocknews.evals "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: .evals/report.json
+          if-no-files-found: ignore
