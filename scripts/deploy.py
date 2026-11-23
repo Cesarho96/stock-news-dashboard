@@ -299,13 +299,29 @@ def cmd_check_models(args) -> None:
     print("all models of this profile answered with the features the agent uses")
 
 
-def bootstrap_overrides(args, previous: dict[str, str]) -> dict[str, str]:
+def github_sub_prefix(repo: str) -> str:
+    """Start of the OIDC subject GitHub issues for `repo`, read with the GitHub CLI ("" without it).
+    Repositories created after July 15, 2026 get immutable IDs: repo:OWNER@OWNER_ID/REPO@REPO_ID."""
+    if not shutil.which("gh"):
+        return ""
+    r = gh(["api", f"repos/{repo}/actions/oidc/customization/sub", "--jq", ".sub_claim_prefix // empty"])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def check_sub_prefix(prefix: str, repo: str) -> None:
+    if prefix and re.sub(r"@\d+", "", prefix).lower() != f"repo:{repo}".lower():
+        raise SystemExit(f"the OIDC subject prefix {prefix!r} belongs to another repository than {repo}")
+
+
+def bootstrap_overrides(args, previous: dict[str, str], detected_prefix: str = "") -> dict[str, str]:
     """Options not given on a re-run keep the values the stack has. Above all, a GitHub OIDC provider this
     stack created stays: dropping --create-oidc-provider must not delete it (CI depends on it)."""
     oidc = "true" if args.create_oidc_provider else previous.get("CreateOidcProvider", "false")
     if oidc == "true" and not args.create_oidc_provider:
         print("note: keeping the GitHub OIDC provider this stack created (CreateOidcProvider=true)")
-    return {"GitHubRepository": args.github_repo, "CreateOidcProvider": oidc,
+    prefix = args.github_sub_prefix or detected_prefix or previous.get("GitHubSubjectPrefix", "")
+    check_sub_prefix(prefix, args.github_repo)
+    return {"GitHubRepository": args.github_repo, "GitHubSubjectPrefix": prefix, "CreateOidcProvider": oidc,
             "MonthlyBudgetUsd": str(args.budget if args.budget is not None else previous.get("MonthlyBudgetUsd", 30)),
             "BudgetEmail": args.email if args.email is not None else previous.get("BudgetEmail", ""),
             "AppName": os.environ.get("STACK_PREFIX", "stock-news-dashboard")}
@@ -313,7 +329,13 @@ def bootstrap_overrides(args, previous: dict[str, str]) -> dict[str, str]:
 
 def cmd_bootstrap(args) -> None:
     sess = session(args.region, args.profile)
-    overrides = bootstrap_overrides(args, previous_parameters(sess, bootstrap_stack()))
+    overrides = bootstrap_overrides(args, previous_parameters(sess, bootstrap_stack()),
+                                    "" if args.github_sub_prefix else github_sub_prefix(args.github_repo))
+    subject = overrides["GitHubSubjectPrefix"] or f"repo:{args.github_repo}"
+    print(f"CI roles trust GitHub OIDC subjects starting with {subject}"
+          + (" (immutable owner and repository IDs)" if "@" in subject else
+             " (classic format; repositories created after July 15, 2026 need the GitHub CLI signed in, or "
+             "--github-sub-prefix, so the IDs are included)"))
     sam_deploy(sess, bootstrap_stack(),
                [tool("sam"), "deploy", "--template-file", str(ROOT / "infra" / "bootstrap.yaml"), "--stack-name",
                 bootstrap_stack(), "--region", sess.region_name, "--capabilities", "CAPABILITY_NAMED_IAM",
@@ -511,6 +533,12 @@ def cmd_github_setup(args) -> None:
         return
     if gh(["auth", "status"]).returncode != 0:
         raise SystemExit("the GitHub CLI is not signed in: run gh auth login, then this command again")
+    issued = github_sub_prefix(repo)
+    trusted = previous_parameters(sess, bootstrap_stack()).get("GitHubSubjectPrefix") or f"repo:{repo}"
+    if issued and issued != trusted:
+        print(f"WARNING: GitHub issues OIDC subjects starting with {issued}, but the CI roles trust {trusted}, so "
+              "every AWS job would fail with 'Not authorized to perform sts:AssumeRoleWithWebIdentity'. Run the "
+              f"bootstrap again (it reads the new prefix): python scripts/deploy.py bootstrap --github-repo {repo}\n")
     for name, value in variables.items():
         r = gh(["variable", "set", name, "--repo", repo, "--body", value])
         if r.returncode != 0:
@@ -567,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
                         "a provider this stack created)")
     p.add_argument("--budget", type=int, help="monthly AWS budget alert in USD (default 30, or the current value)")
     p.add_argument("--email", help="email for budget alerts (default: the current value)")
+    p.add_argument("--github-sub-prefix", help="OIDC subject prefix, e.g. repo:OWNER@123/REPO@456 (default: read "
+                                               "with the GitHub CLI, or the current value)")
     p.set_defaults(fn=cmd_bootstrap)
     for name, fn, text in (("package", cmd_package, "build and upload a release"),
                            ("app", cmd_app, "deploy the stack for a release"),

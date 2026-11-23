@@ -108,6 +108,7 @@ Prerequisites: Python 3.10+ (`pip install -r requirements-dev.txt`), the AWS SAM
    python scripts/deploy.py bootstrap --github-repo Cesarho96/stock-news-dashboard --email you@example.com --create-oidc-provider
    ```
    Run it again whenever `infra/bootstrap.yaml` changes. Options you leave out keep their current values (a provider the stack created is kept). With a named AWS profile, put `--profile NAME` before the command: `python scripts/deploy.py --profile NAME bootstrap ...`.
+   With the [GitHub CLI](https://cli.github.com/) signed in, the bootstrap reads the OIDC subject GitHub issues for the repository, so the CI roles trust exactly it: repositories created after July 15, 2026 get immutable owner and repository IDs in it (`repo:OWNER@ID/REPO@ID`), which the classic `repo:OWNER/REPO` pattern does not match.
 4. **Deploy.** Through GitHub (recommended, see section 3), or from your machine:
    ```powershell
    $env:ALARM_EMAIL = "you@example.com"; $env:SEC_USER_AGENT = "Your Name you@example.com"
@@ -183,6 +184,8 @@ It reads the bootstrap outputs and configures the repository the bootstrap roles
 Without the GitHub CLI (or with `--dry-run`) it prints the values and where to set them by hand. Start the first run with `gh workflow run release --ref main` (or Actions > release > Run workflow).
 
 Work on a branch, open a PR (ci + evals run), merge, approve the production deployment. Once CI deploys, stop running `release` from your machine: two deployments of the same stack at once collide.
+
+If an AWS job fails with *Not authorized to perform sts:AssumeRoleWithWebIdentity*, the CI roles trust another OIDC subject than the one GitHub issues for the repository. Run the bootstrap again with the GitHub CLI signed in (it reads the subject; `github-setup` warns about a mismatch), then re-run the failed jobs.
 
 ## 4. Run the real pipeline and the evals on your machine
 

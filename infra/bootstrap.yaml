@@ -15,6 +15,14 @@ Parameters:
     Type: String
     AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
     Description: OWNER/REPO whose workflows may assume the CI roles.
+  GitHubSubjectPrefix:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(repo:[A-Za-z0-9_.-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?)?$"
+    Description: >-
+      Start of the OIDC subject (sub) GitHub issues for the repository. Repositories created after
+      July 15, 2026 use immutable IDs: repo:OWNER@OWNER_ID/REPO@REPO_ID. scripts/deploy.py bootstrap
+      reads it with the GitHub CLI. Empty means the classic repo:OWNER/REPO.
   CreateOidcProvider:
     Type: String
     Default: "true"
@@ -34,6 +42,7 @@ Parameters:
 Conditions:
   CreateOidc: !Equals [!Ref CreateOidcProvider, "true"]
   HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
+  HasSubjectPrefix: !Not [!Equals [!Ref GitHubSubjectPrefix, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -253,10 +262,16 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub:
-                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/main"
-                  - !Sub "repo:${GitHubRepository}:environment:dev"
-                  - !Sub "repo:${GitHubRepository}:environment:production"
+                token.actions.githubusercontent.com:sub: # main, and jobs in the dev / production environments
+                  - !Sub
+                    - "${Subject}:ref:refs/heads/main"
+                    - Subject: !If [HasSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubRepository}"]
+                  - !Sub
+                    - "${Subject}:environment:dev"
+                    - Subject: !If [HasSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubRepository}"]
+                  - !Sub
+                    - "${Subject}:environment:production"
+                    - Subject: !If [HasSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubRepository}"]
       Policies:
         - PolicyName: release-pipeline
           PolicyDocument:
@@ -349,9 +364,13 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub:
-                  - !Sub "repo:${GitHubRepository}:pull_request"
-                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/*"
+                token.actions.githubusercontent.com:sub: # pull requests and branch runs (schedule, manual)
+                  - !Sub
+                    - "${Subject}:pull_request"
+                    - Subject: !If [HasSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubRepository}"]
+                  - !Sub
+                    - "${Subject}:ref:refs/heads/*"
+                    - Subject: !If [HasSubjectPrefix, !Ref GitHubSubjectPrefix, !Sub "repo:${GitHubRepository}"]
       Policies:
         - PolicyName: evals
           PolicyDocument:
